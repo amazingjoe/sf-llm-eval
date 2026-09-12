@@ -1,0 +1,49 @@
+version: 1
+
+# Global pipeline models. These are used for every test in every test-set.
+# They are NOT the model under test; that lives on each file in test-sets/.
+
+normalizer:
+  endpoint: "https://openrouter.ai/api/v1/chat/completions"
+  api_key: "${openrouter_key}"
+
+  # Strong, stable extractor. Keep this fixed so normalization is comparable
+  # across subject-model suites.
+  model: "openai/gpt-5.6-luna"
+
+  headers:
+    X-Title: "Salesforce Open Model Benchmark - Normalizer"
+
+  timeout_seconds: 120
+  extra_payload: {}
+
+evaluator:
+  # "deterministic" scores normalized.json with schema + field checks (current).
+  # "judge" is reserved for a future LLM-as-judge path that will call the
+  # model below. That path is not implemented yet.
+  mode: deterministic
+
+  endpoint: "https://openrouter.ai/api/v1/chat/completions"
+  api_key: "${openrouter_key}"
+  model: "openai/gpt-5.6-luna"
+
+  headers:
+    X-Title: "Salesforce Open Model Benchmark - Evaluator"
+
+  timeout_seconds: 120
+  extra_payload: {}
+
+# Local Salesforce CLI session. Used when a test lists Salesforce tools.
+# The harness targets this alias on every CLI call; tests never pick an org.
+salesforce:
+  alias: harness-org
+  # Optional. Abort the suite if the connected org id does not match.
+  # expected_org_id: "00Dxxxxxxxxxxxx"
+  confirm: true
+  timeout_seconds: 120
+  login_timeout_seconds: 600
+  max_output_bytes: 400000
+  max_records: 200
+
+logging:
+  output_dir: "runs"

@@ -1,0 +1,44 @@
+version: 1
+
+suite:
+  id: harness_smoke
+  name: Harness smoke suite
+  description: >
+    Runs the health-check, account-lookup, and web-search smoke tests
+    against a single OpenRouter model. Swap provider.model to benchmark a
+    different model without editing individual tests.
+
+provider:
+  endpoint: "https://openrouter.ai/api/v1/chat/completions"
+  api_key: "${openrouter_key}"
+
+  # Replace with the OpenRouter model slug you want to benchmark.
+  model: "openai/gpt-5.6-luna"
+
+  headers:
+    X-Title: "Salesforce Open Model Benchmark"
+
+  timeout_seconds: 120
+  extra_payload: {}
+
+categories:
+  - id: harness_health_check
+    emoji: "🧪"
+    name: Harness health checks
+    tests:
+      - tests/harness_test.yaml
+
+  - id: salesforce_account_lookup
+    emoji: "🏢"
+    name: Salesforce account lookup
+    tests:
+      - tests/acme_lookup.yaml
+
+  - id: web_search
+    emoji: "🌐"
+    name: Web search
+    tests:
+      - tests/salesforce_ceo.yaml
+
+logging:
+  output_dir: "runs"
