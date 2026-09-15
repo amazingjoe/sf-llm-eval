@@ -42,7 +42,9 @@ salesforce:
   confirm: true
   timeout_seconds: 120
   login_timeout_seconds: 600
-  max_output_bytes: 400000
+  # Raw `sf` stdout before describe slimming / query record truncation.
+  # This is not the payload sent back to the model.
+  max_output_bytes: 8000000
   max_records: 200
 
 logging:

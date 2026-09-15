@@ -163,6 +163,11 @@ function formatCost(value) {
   return `$${n.toFixed(4)}`;
 }
 
+function formatTokens(value) {
+  if (value == null || Number.isNaN(Number(value))) return "—";
+  return new Intl.NumberFormat("en-US").format(Math.round(Number(value)));
+}
+
 function formatScore(score) {
   if (score == null || Number.isNaN(Number(score))) return "—";
   return Number(score).toFixed(2);
@@ -253,18 +258,35 @@ function numericField(test, key) {
   const direct = Number(test?.[key]);
   if (Number.isFinite(direct)) return direct;
   const metrics = test?.metrics;
-  if (key === "latency_ms" && Number.isFinite(Number(metrics?.latency_ms))) {
-    return Number(metrics.latency_ms);
+  const nested = {
+    latency_ms: metrics?.latency_ms,
+    cost_usd: metrics?.cost_usd,
+    total_tokens: metrics?.total_tokens,
+    normalizer_cost_usd: test?.normalizer_metrics?.cost_usd,
+    normalizer_tokens: test?.normalizer_metrics?.total_tokens,
+    evaluator_cost_usd: test?.evaluator_metrics?.cost_usd,
+    evaluator_tokens: test?.evaluator_metrics?.total_tokens,
+  };
+  if (key in nested && Number.isFinite(Number(nested[key]))) {
+    return Number(nested[key]);
   }
-  if (key === "cost_usd" && Number.isFinite(Number(metrics?.cost_usd))) {
-    return Number(metrics.cost_usd);
+  if (key === "pipeline_cost_usd" || key === "pipeline_tokens") {
+    const parts =
+      key === "pipeline_cost_usd"
+        ? [numericField(test, "normalizer_cost_usd"), numericField(test, "evaluator_cost_usd")]
+        : [numericField(test, "normalizer_tokens"), numericField(test, "evaluator_tokens")];
+    const present = parts.filter((n) => Number.isFinite(n));
+    return present.length ? present.reduce((a, b) => a + b, 0) : null;
   }
-  if (key === "total_cost_usd") {
-    const model = Number(metrics?.cost_usd);
-    const norm = Number(test?.normalizer_metrics?.cost_usd);
-    if (Number.isFinite(model) || Number.isFinite(norm)) {
-      return (Number.isFinite(model) ? model : 0) + (Number.isFinite(norm) ? norm : 0);
-    }
+  if (key === "run_cost_usd" || key === "total_cost_usd") {
+    const parts = [numericField(test, "cost_usd"), numericField(test, "pipeline_cost_usd")];
+    const present = parts.filter((n) => Number.isFinite(n));
+    return present.length ? present.reduce((a, b) => a + b, 0) : null;
+  }
+  if (key === "run_tokens") {
+    const parts = [numericField(test, "total_tokens"), numericField(test, "pipeline_tokens")];
+    const present = parts.filter((n) => Number.isFinite(n));
+    return present.length ? present.reduce((a, b) => a + b, 0) : null;
   }
   return null;
 }
@@ -312,7 +334,7 @@ function categoryStats(tests) {
     errors,
     modelMs: sumNumbers(tests, "latency_ms"),
     wallMs: categoryWallMs(tests),
-    cost: sumNumbers(tests, "total_cost_usd") ?? sumNumbers(tests, "cost_usd"),
+    cost: sumNumbers(tests, "cost_usd"),
     emoji: tests.find((test) => test.category_emoji)?.category_emoji || "",
     name: tests[0]?.category_name || tests[0]?.category_id || "Ungrouped",
   };
@@ -428,7 +450,7 @@ function renderBoard() {
             <div class="stat"><b>${counts.total ?? run.tests.length}</b> tests</div>
             <div class="stat"><b>${escapeHtml(formatMs(totals.latency_ms))}</b> model time</div>
             ${wall ? `<div class="stat"><b>${escapeHtml(wall)}</b> wall</div>` : ""}
-            <div class="stat"><b>${escapeHtml(formatCost(totals.cost_usd))}</b> cost</div>
+            <div class="stat"><b>${escapeHtml(formatCost(totals.cost_usd))}</b> model cost</div>
             <div class="stat"><b>${escapeHtml(costPerTask(totals.cost_usd, counts.pass))}</b> per task</div>
           </div>
           <div class="expand-row">
@@ -674,6 +696,99 @@ function fieldCards(test) {
   </details>`;
 }
 
+function packSection({ title, meta, open, body }) {
+  return `<details class="panel fold pack"${open ? " open" : ""}>
+    <summary>
+      ${escapeHtml(title)}
+      ${meta ? `<span class="fold-meta">${meta}</span>` : ""}
+    </summary>
+    <div class="pack-body">${body}</div>
+  </details>`;
+}
+
+function promptAnswerPack(test) {
+  const system = test.system_prompt
+    ? `<article class="panel">
+        <h3>System prompt</h3>
+        <div class="body prose">${escapeHtml(test.system_prompt)}</div>
+      </article>`
+    : "";
+  const reasoning = test.response_view?.reasoning
+    ? `<article class="panel">
+        <h3>Reasoning</h3>
+        <div class="body prose">${escapeHtml(test.response_view.reasoning)}</div>
+      </article>`
+    : "";
+  return packSection({
+    title: "Prompt and answer",
+    open: true,
+    body: `${system}
+      <article class="panel">
+        <h3>Prompt</h3>
+        <div class="body prose">${escapeHtml(test.prompt || "No prompt recorded.")}</div>
+      </article>
+      <article class="panel">
+        <h3>Model answer</h3>
+        <div class="body prose">${escapeHtml(test.answer || "No answer.txt")}</div>
+      </article>
+      ${reasoning}`,
+  });
+}
+
+function inspectionPack(run, test) {
+  const schemaErrors = test.schema_errors || test.evaluation?.schema?.errors || [];
+  const checks = test.evaluation?.checks || [];
+  const passed = checks.filter((check) => check.passed).length;
+  const failed = checks.length - passed;
+  const toolN =
+    test.tools?.client_tool_executions ??
+    test.metrics?.client_tool_executions ??
+    "";
+  const metaParts = [];
+  if (checks.length) {
+    metaParts.push(
+      `<span class="fold-tally"><span class="pass">${passed} pass</span><span class="fail">${failed} fail</span></span>`
+    );
+  }
+  if (toolN !== "" && toolN != null) {
+    metaParts.push(`<span class="fold-count">${escapeHtml(String(toolN))}</span>`);
+  }
+  const schema = schemaErrors.length
+    ? `<article class="panel"><h3>Schema</h3><pre>${escapeHtml(
+        schemaErrors.map((error) => JSON.stringify(error)).join("\n")
+      )}</pre></article>`
+    : "";
+  const errorTrace = test.error_trace
+    ? `<article class="panel"><h3>Error trace</h3><pre>${escapeHtml(
+        test.error_trace
+      )}</pre></article>`
+    : "";
+  return packSection({
+    title: "Run inspection",
+    open: false,
+    meta: metaParts.join(""),
+    body: `${fieldCards(test)}
+      ${toolsPanel(test)}
+      ${schema}
+      <article class="panel">
+        <h3>Normalized fields</h3>
+        <pre>${
+          test.normalized == null ? "No normalized.json" : highlightJson(test.normalized)
+        }</pre>
+      </article>
+      <details class="panel fold">
+        <summary>Request</summary>
+        <pre>${test.request ? highlightJson(test.request) : "No request.json"}</pre>
+      </details>
+      <details class="panel fold">
+        <summary>Response</summary>
+        <pre>${test.response ? highlightJson(test.response) : "No response.json"}</pre>
+      </details>
+      ${errorTrace}
+      ${runCostSection(run, test)}`,
+  });
+}
+
 function renderCategoryRail(run, current) {
   const tests = run.tests || [];
   const runActive = !current;
@@ -739,6 +854,187 @@ function renderCategoryRail(run, current) {
     })
     .join("");
   return `${overview}${cats}`;
+}
+
+function costCell(cost, tokens) {
+  return `<b>${escapeHtml(formatCost(cost))}</b><span>${escapeHtml(formatTokens(tokens))} tok</span>`;
+}
+
+function sumCostSnapshot(tests) {
+  return {
+    cost_usd: sumNumbers(tests, "cost_usd"),
+    total_tokens: sumNumbers(tests, "total_tokens"),
+    normalizer_cost_usd: sumNumbers(tests, "normalizer_cost_usd"),
+    normalizer_tokens: sumNumbers(tests, "normalizer_tokens"),
+    evaluator_cost_usd: sumNumbers(tests, "evaluator_cost_usd"),
+    evaluator_tokens: sumNumbers(tests, "evaluator_tokens"),
+    pipeline_cost_usd: sumNumbers(tests, "pipeline_cost_usd"),
+    pipeline_tokens: sumNumbers(tests, "pipeline_tokens"),
+    run_cost_usd: sumNumbers(tests, "run_cost_usd"),
+    run_tokens: sumNumbers(tests, "run_tokens"),
+  };
+}
+
+function costRowCells(snap, showEvaluator) {
+  return `<td>${costCell(snap.cost_usd, snap.total_tokens)}</td>
+        <td>${costCell(snap.normalizer_cost_usd, snap.normalizer_tokens)}</td>
+        ${
+          showEvaluator
+            ? `<td>${costCell(snap.evaluator_cost_usd, snap.evaluator_tokens)}</td>`
+            : ""
+        }
+        <td>${costCell(snap.run_cost_usd, snap.run_tokens)}</td>`;
+}
+
+function showsEvaluator(source) {
+  if (!source) return false;
+  if (source.tests) {
+    const totals = source.totals || {};
+    if (
+      Number.isFinite(Number(totals.evaluator_cost_usd)) ||
+      Number.isFinite(Number(totals.evaluator_tokens))
+    ) {
+      return true;
+    }
+    return source.tests.some(
+      (test) =>
+        Number.isFinite(numericField(test, "evaluator_cost_usd")) ||
+        Number.isFinite(numericField(test, "evaluator_tokens"))
+    );
+  }
+  return (
+    Number.isFinite(numericField(source, "evaluator_cost_usd")) ||
+    Number.isFinite(numericField(source, "evaluator_tokens"))
+  );
+}
+
+function costSnapshot(source) {
+  if (source && source.tests) {
+    const totals = source.totals || {};
+    return {
+      cost_usd: totals.cost_usd,
+      total_tokens: totals.total_tokens,
+      normalizer_cost_usd: totals.normalizer_cost_usd,
+      normalizer_tokens: totals.normalizer_tokens,
+      evaluator_cost_usd: totals.evaluator_cost_usd,
+      evaluator_tokens: totals.evaluator_tokens,
+      pipeline_cost_usd: totals.pipeline_cost_usd,
+      pipeline_tokens: totals.pipeline_tokens,
+      run_cost_usd: totals.run_cost_usd,
+      run_tokens: totals.run_tokens,
+    };
+  }
+  return {
+    cost_usd: numericField(source, "cost_usd"),
+    total_tokens: numericField(source, "total_tokens"),
+    normalizer_cost_usd: numericField(source, "normalizer_cost_usd"),
+    normalizer_tokens: numericField(source, "normalizer_tokens"),
+    evaluator_cost_usd: numericField(source, "evaluator_cost_usd"),
+    evaluator_tokens: numericField(source, "evaluator_tokens"),
+    pipeline_cost_usd: numericField(source, "pipeline_cost_usd"),
+    pipeline_tokens: numericField(source, "pipeline_tokens"),
+    run_cost_usd: numericField(source, "run_cost_usd"),
+    run_tokens: numericField(source, "run_tokens"),
+  };
+}
+
+function runCostSection(run, currentTest) {
+  const single = Boolean(currentTest);
+  const source = single ? currentTest : run;
+  const totals = costSnapshot(source);
+  const showEvaluator = showsEvaluator(source);
+  const totalLabel = single ? "Test total" : "Run total";
+  const blurb = single
+    ? "All token spend for this test. Usage above is subject-model inference only; normalizer and evaluator spend is counted here."
+    : "All token spend for this suite run. Individual tests report subject-model inference only; normalizer and evaluator spend is counted here.";
+  const tests = single ? [] : run.tests || [];
+  let rows = "";
+  for (const group of testsByCategory(tests).values()) {
+    const stats = categoryStats(group);
+    const categorySnap = sumCostSnapshot(group);
+    rows += `<tr class="cost-category">
+        <td>
+          <strong>${
+            stats.emoji ? `<span class="category-emoji">${escapeHtml(stats.emoji)}</span>` : ""
+          }${escapeHtml(stats.name)}</strong>
+          <span>${stats.total} test${stats.total === 1 ? "" : "s"}</span>
+        </td>
+        ${costRowCells(categorySnap, showEvaluator)}
+      </tr>`;
+    for (const test of group) {
+      rows += `<tr class="cost-test">
+        <td>
+          <strong>${escapeHtml(displayName(test))}</strong>
+          <span>${escapeHtml(test.test_id)}</span>
+        </td>
+        ${costRowCells(costSnapshot(test), showEvaluator)}
+      </tr>`;
+    }
+  }
+
+  return `<details class="panel fold run-costs">
+    <summary>
+      Testing run costs
+      <span class="fold-meta">
+        <span class="fold-count">${escapeHtml(formatCost(totals.run_cost_usd))}</span>
+        <span>${escapeHtml(formatTokens(totals.run_tokens))} tok</span>
+      </span>
+    </summary>
+    <p class="muted">${blurb}</p>
+    <div class="kv">
+      <div>
+        <span>Inference</span>
+        <b>${escapeHtml(formatCost(totals.cost_usd))}</b>
+        <em>${escapeHtml(formatTokens(totals.total_tokens))} tok</em>
+      </div>
+      <div>
+        <span>Normalizer</span>
+        <b>${escapeHtml(formatCost(totals.normalizer_cost_usd))}</b>
+        <em>${escapeHtml(formatTokens(totals.normalizer_tokens))} tok</em>
+      </div>
+      ${
+        showEvaluator
+          ? `<div>
+        <span>Evaluator</span>
+        <b>${escapeHtml(formatCost(totals.evaluator_cost_usd))}</b>
+        <em>${escapeHtml(formatTokens(totals.evaluator_tokens))} tok</em>
+      </div>`
+          : ""
+      }
+      <div>
+        <span>Pipeline</span>
+        <b>${escapeHtml(formatCost(totals.pipeline_cost_usd))}</b>
+        <em>${escapeHtml(formatTokens(totals.pipeline_tokens))} tok</em>
+      </div>
+      <div class="cost-total">
+        <span>${totalLabel}</span>
+        <b>${escapeHtml(formatCost(totals.run_cost_usd))}</b>
+        <em>${escapeHtml(formatTokens(totals.run_tokens))} tok</em>
+      </div>
+    </div>
+    ${
+      rows
+        ? `<table class="cost-table">
+      <thead>
+        <tr>
+          <th>Category / test</th>
+          <th>Inference</th>
+          <th>Normalizer</th>
+          ${showEvaluator ? "<th>Evaluator</th>" : ""}
+          <th>Total</th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
+      <tfoot>
+        <tr>
+          <td>Suite</td>
+          ${costRowCells(totals, showEvaluator)}
+        </tr>
+      </tfoot>
+    </table>`
+        : ""
+    }
+  </details>`;
 }
 
 function renderRunOverview(run) {
@@ -807,7 +1103,7 @@ function renderRunOverview(run) {
               <div><span>Tests</span><b>${counts.total ?? (run.tests || []).length}</b></div>
               <div><span>Model time</span><b>${escapeHtml(formatMs(totals.latency_ms))}</b></div>
               <div><span>Wall</span><b>${escapeHtml(wall || "—")}</b></div>
-              <div><span>Cost</span><b>${escapeHtml(formatCost(totals.cost_usd))}</b></div>
+              <div><span>Model cost</span><b>${escapeHtml(formatCost(totals.cost_usd))}</b></div>
               <div><span>Per task</span><b>${escapeHtml(
                 costPerTask(totals.cost_usd, counts.pass)
               )}</b></div>
@@ -818,6 +1114,7 @@ function renderRunOverview(run) {
               ? `<div class="run-cats">${categories}</div>`
               : `<p class="muted">No tests were recorded in this run.</p>`
           }
+          ${runCostSection(run)}
         </section>
       </div>
     </div>`;
@@ -837,7 +1134,6 @@ function renderDetail(run, selected) {
 
   const metrics = current.metrics || {};
   const nmetrics = current.normalizer_metrics || {};
-  const schemaErrors = current.schema_errors || current.evaluation?.schema?.errors || [];
 
   app.innerHTML = `
     <div class="stage" role="dialog" aria-modal="true" aria-label="${escapeHtml(displayName(current))}">
@@ -869,11 +1165,9 @@ function renderDetail(run, selected) {
               <h3>Usage</h3>
               <div class="kv">
                 <div><span>Latency</span><b>${escapeHtml(formatMs(metrics.latency_ms))}</b></div>
-                <div><span>Tokens</span><b>${escapeHtml(metrics.total_tokens ?? "—")}</b></div>
+                <div><span>Tokens</span><b>${escapeHtml(formatTokens(metrics.total_tokens))}</b></div>
                 <div><span>Cost</span><b>${escapeHtml(formatCost(metrics.cost_usd))}</b></div>
                 <div><span>Normalizer</span><b>${escapeHtml(formatMs(nmetrics.latency_ms))}</b></div>
-                <div><span>Norm. tokens</span><b>${escapeHtml(nmetrics.total_tokens ?? "—")}</b></div>
-                <div><span>Norm. cost</span><b>${escapeHtml(formatCost(nmetrics.cost_usd))}</b></div>
                 <div><span>Rounds</span><b>${escapeHtml(metrics.rounds ?? current.tools?.rounds_used ?? "—")}</b></div>
                 <div><span>Tool calls</span><b>${escapeHtml(
                   metrics.client_tool_executions ?? current.tools?.client_tool_executions ?? "—"
@@ -881,62 +1175,8 @@ function renderDetail(run, selected) {
               </div>
             </article>
           ${current.error ? `<div class="error-banner">${escapeHtml(current.error)}</div>` : ""}
-          ${fieldCards(current)}
-          ${toolsPanel(current)}
-          ${
-            schemaErrors.length
-              ? `<div class="panel"><h3>Schema</h3><pre>${escapeHtml(
-                  schemaErrors.map((e) => JSON.stringify(e)).join("\n")
-                )}</pre></div>`
-              : ""
-          }
-          <div class="panels">
-            <article class="panel">
-              <h3>Model answer</h3>
-              <div class="body prose">${escapeHtml(current.answer || "No answer.txt")}</div>
-            </article>
-            ${
-              current.response_view?.reasoning
-                ? `<article class="panel"><h3>Reasoning</h3><div class="body prose">${escapeHtml(
-                    current.response_view.reasoning
-                  )}</div></article>`
-                : ""
-            }
-            <article class="panel">
-              <h3>Normalized fields</h3>
-              <pre>${
-                current.normalized == null
-                  ? "No normalized.json"
-                  : highlightJson(current.normalized)
-              }</pre>
-            </article>
-            <article class="panel">
-              <h3>Prompt</h3>
-              <div class="body prose">${escapeHtml(current.prompt || "No prompt recorded.")}</div>
-            </article>
-            ${
-              current.system_prompt
-                ? `<article class="panel"><h3>System prompt</h3><div class="body prose">${escapeHtml(
-                    current.system_prompt
-                  )}</div></article>`
-                : ""
-            }
-            <details class="panel fold">
-              <summary>Request</summary>
-              <pre>${current.request ? highlightJson(current.request) : "No request.json"}</pre>
-            </details>
-            <details class="panel fold">
-              <summary>Response</summary>
-              <pre>${current.response ? highlightJson(current.response) : "No response.json"}</pre>
-            </details>
-            ${
-              current.error_trace
-                ? `<article class="panel"><h3>Error trace</h3><pre>${escapeHtml(
-                    current.error_trace
-                  )}</pre></article>`
-                : ""
-            }
-          </div>
+          ${promptAnswerPack(current)}
+          ${inspectionPack(run, current)}
         </section>
       </div>
     </div>`;

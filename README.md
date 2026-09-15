@@ -68,13 +68,23 @@ Runs every test in the test-set: inference, normalization, and evaluation:
 python runner.py --suite test-sets/harness_smoke.yaml
 ```
 
-Subset of a suite:
+Subset of a suite. `--category` and `--only` are repeatable:
 
 ```bash
 python runner.py --suite test-sets/harness_smoke.yaml --category harness_health_check
 python runner.py --suite test-sets/harness_smoke.yaml --category web_search
 python runner.py --suite test-sets/harness_smoke.yaml --only harness_test_001
+python runner.py --suite test-sets/harness_smoke.yaml \
+  --category harness_health_check --category web_search
 python runner.py --suite test-sets/harness_smoke.yaml --yes   # skip Salesforce org prompt when already connected
+```
+
+`--config` is optional (auto-discovered from the project root). `--run-dir` is
+optional; omit it to create `runs/<suite-id>/<timestamp>/` automatically:
+
+```bash
+python runner.py --suite test-sets/harness_smoke.yaml --config config.yaml
+python runner.py --suite test-sets/harness_smoke.yaml --run-dir runs/harness_smoke/my-run
 ```
 
 ### Inference only
@@ -92,7 +102,7 @@ python normalizer.py \
   --config config.yaml \
   --suite test-sets/harness_smoke.yaml \
   --test tests/acme_lookup.yaml \
-  --run-dir runs/harness_smoke/<run-id>/salesforce_account_lookup/account_lookup_001
+  --run-dir runs/harness_smoke/<run-id>/salesforce_record_operations/account_lookup_001
 ```
 
 ### Evaluator only
@@ -102,7 +112,25 @@ python evaluator.py \
   --config config.yaml \
   --suite test-sets/harness_smoke.yaml \
   --test tests/acme_lookup.yaml \
-  --run-dir runs/harness_smoke/<run-id>/salesforce_account_lookup/account_lookup_001
+  --run-dir runs/harness_smoke/<run-id>/salesforce_record_operations/account_lookup_001
+```
+
+`--config` is optional on the normalizer and evaluator as well (auto-discovered
+if omitted). `--suite` is required unless the test file already includes
+provider fields.
+
+### Workbench (visualizer)
+
+Local UI for runs, config, tests, and test-sets:
+
+```bash
+python visualizer/serve.py
+```
+
+Then open http://127.0.0.1:8765. Optional flags:
+
+```bash
+python visualizer/serve.py --host 127.0.0.1 --port 8765 --runs runs
 ```
 
 ### Unit tests
@@ -142,16 +170,23 @@ response_meta.json
 answer.txt
 metrics.json
 tool_trace.json
+error.txt                    # when inference or a pipeline step fails
 rounds/00/request.json
 rounds/00/response.json
-rounds/00/annotations.json   # when search citations are present
-rounds/00/tool_results.json  # when client tools ran
+rounds/00/response.raw.txt
+rounds/00/response_meta.json
+rounds/00/annotations.json     # when search citations are present
+rounds/00/tool_results.json    # when client tools ran
+rounds/00/tool_messages.json   # tool messages sent back to the model
 
 normalizer_request.json
+normalizer_request_meta.json
 normalizer_response.raw.txt
 normalizer_response.json
+normalizer_response_meta.json
 normalizer_metrics.json
 normalized.json
+normalized_parse_error.txt     # when the normalizer did not return JSON
 
 evaluation.json
 ```

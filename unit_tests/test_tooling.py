@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from common import redact_secrets, translate_tool, translate_tools
+from common import load_yaml_object, redact_secrets, translate_tool, translate_tools
 from salesforce import (
     SalesforceCliError,
     SalesforceCliProvider,
@@ -133,6 +133,31 @@ class TranslateToolTests(unittest.TestCase):
     def test_dict_type_shorthand(self) -> None:
         tool = translate_tool({"type": "salesforce.query"})
         self.assertEqual(tool["function"]["name"], "salesforce_query")
+
+
+class SuiteCategoryTests(unittest.TestCase):
+    root = Path(__file__).resolve().parents[1]
+
+    def test_record_operations_category_lists_discovery_test(self) -> None:
+        suite = load_yaml_object(self.root / "test-sets" / "harness_smoke.yaml")
+        category = next(
+            item
+            for item in suite["categories"]
+            if item["id"] == "salesforce_record_operations"
+        )
+        self.assertEqual(category["name"], "Salesforce record operations")
+        self.assertIn("tests/acme_lookup.yaml", category["tests"])
+        self.assertIn("tests/acme_object_discovery.yaml", category["tests"])
+        self.assertFalse(
+            any(item["id"] == "salesforce_account_lookup" for item in suite["categories"])
+        )
+
+    def test_object_discovery_advertises_describe_and_query(self) -> None:
+        raw = load_yaml_object(self.root / "tests" / "acme_object_discovery.yaml")
+        tools = translate_tools(raw["request"]["tools"])
+        names = [tool["function"]["name"] for tool in tools]
+        self.assertEqual(names, ["salesforce_describe", "salesforce_query"])
+        self.assertTrue(test_needs_salesforce(raw))
 
 
 class RedactionTests(unittest.TestCase):

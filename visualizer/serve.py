@@ -488,13 +488,46 @@ def discover_runs(runs_dir: Path) -> list[dict[str, Any]]:
     return runs
 
 
+def _metric_number(blob: Any, key: str) -> float | None:
+    if isinstance(blob, dict) and isinstance(blob.get(key), (int, float)):
+        return float(blob[key])
+    return None
+
+
+def _sum_known(*values: float | None) -> float | None:
+    present = [value for value in values if value is not None]
+    if not present:
+        return None
+    return float(sum(present))
+
+
+def _int_or_none(value: float | None) -> int | None:
+    if value is None:
+        return None
+    return int(value)
+
+
+def _add_usage_bucket(
+    bucket: dict[str, Any], prefix: str, cost: float | None, tokens: float | None
+) -> None:
+    if cost is not None:
+        bucket[f"{prefix}_cost"] = bucket.get(f"{prefix}_cost", 0.0) + cost
+        bucket[f"has_{prefix}_cost"] = True
+    if tokens is not None:
+        bucket[f"{prefix}_tokens"] = bucket.get(f"{prefix}_tokens", 0.0) + tokens
+        bucket[f"has_{prefix}_tokens"] = True
+
+
+def _bucket_pair(bucket: dict[str, Any], prefix: str) -> tuple[float | None, int | None]:
+    cost = bucket.get(f"{prefix}_cost") if bucket.get(f"has_{prefix}_cost") else None
+    tokens = int(bucket[f"{prefix}_tokens"]) if bucket.get(f"has_{prefix}_tokens") else None
+    return cost, tokens
+
+
 def enrich_run(summary: dict[str, Any], run_dir: Path) -> dict[str, Any]:
     tests_out: list[dict[str, Any]] = []
-    total_cost = 0.0
-    total_tokens = 0
+    buckets: dict[str, Any] = {}
     total_latency = 0.0
-    has_cost = False
-    has_tokens = False
     has_latency = False
     category_lookup = suite_category_index(load_yaml(run_dir / "suite.yaml"))
     suite_id = str(summary.get("suite_id") or run_dir.parent.name)
@@ -507,6 +540,7 @@ def enrich_run(summary: dict[str, Any], run_dir: Path) -> dict[str, Any]:
         test_dir = run_dir / category_id / test_id if category_id and test_id else None
         metrics = read_json(test_dir / "metrics.json") if test_dir else None
         normalizer_metrics = read_json(test_dir / "normalizer_metrics.json") if test_dir else None
+        evaluator_metrics = read_json(test_dir / "evaluator_metrics.json") if test_dir else None
         evaluation = read_json(test_dir / "evaluation.json") if test_dir else None
         source = read_json(test_dir / "source.json") if test_dir else None
         name = None
@@ -525,38 +559,31 @@ def enrich_run(summary: dict[str, Any], run_dir: Path) -> dict[str, Any]:
             or cat_meta.get("emoji")
             or library_category_emoji(suite_id, category_id)
         )
-        cost = None
-        tokens = None
-        combined_cost = 0.0
-        has_combined_cost = False
-        normalizer_latency = None
+        inference_cost = _metric_number(metrics, "cost_usd")
+        inference_tokens = _metric_number(metrics, "total_tokens")
+        normalizer_cost = _metric_number(normalizer_metrics, "cost_usd")
+        normalizer_tokens = _metric_number(normalizer_metrics, "total_tokens")
+        evaluator_cost = _metric_number(evaluator_metrics, "cost_usd")
+        evaluator_tokens = _metric_number(evaluator_metrics, "total_tokens")
+        pipeline_cost = _sum_known(normalizer_cost, evaluator_cost)
+        pipeline_tokens = _sum_known(normalizer_tokens, evaluator_tokens)
+        run_cost = _sum_known(inference_cost, pipeline_cost)
+        run_tokens = _sum_known(inference_tokens, pipeline_tokens)
+        _add_usage_bucket(buckets, "inference", inference_cost, inference_tokens)
+        _add_usage_bucket(buckets, "normalizer", normalizer_cost, normalizer_tokens)
+        _add_usage_bucket(buckets, "evaluator", evaluator_cost, evaluator_tokens)
+        _add_usage_bucket(buckets, "pipeline", pipeline_cost, pipeline_tokens)
+        _add_usage_bucket(buckets, "run", run_cost, run_tokens)
+        normalizer_latency = _metric_number(normalizer_metrics, "latency_ms")
         started_at = None
         request_meta = read_json(test_dir / "request_meta.json") if test_dir else None
         if isinstance(request_meta, dict):
             started_at = request_meta.get("started_at_utc")
-        for blob in (metrics, normalizer_metrics):
-            if not isinstance(blob, dict):
-                continue
-            piece_cost = blob.get("cost_usd")
-            piece_tokens = blob.get("total_tokens")
-            if isinstance(piece_cost, (int, float)):
-                total_cost += float(piece_cost)
-                combined_cost += float(piece_cost)
-                has_cost = True
-                has_combined_cost = True
-            if isinstance(piece_tokens, (int, float)):
-                total_tokens += int(piece_tokens)
-                has_tokens = True
         client_tool_executions = None
-        if isinstance(metrics, dict):
-            cost = metrics.get("cost_usd")
-            tokens = metrics.get("total_tokens")
-            if isinstance(metrics.get("client_tool_executions"), (int, float)):
-                client_tool_executions = int(metrics["client_tool_executions"])
-        if isinstance(normalizer_metrics, dict) and isinstance(
-            normalizer_metrics.get("latency_ms"), (int, float)
+        if isinstance(metrics, dict) and isinstance(
+            metrics.get("client_tool_executions"), (int, float)
         ):
-            normalizer_latency = float(normalizer_metrics["latency_ms"])
+            client_tool_executions = int(metrics["client_tool_executions"])
         latency = item.get("latency_ms")
         if isinstance(latency, (int, float)):
             total_latency += float(latency)
@@ -579,14 +606,27 @@ def enrich_run(summary: dict[str, Any], run_dir: Path) -> dict[str, Any]:
                 "status": item.get("status"),
                 "score": item.get("score"),
                 "error": item.get("error"),
-                "cost_usd": cost,
-                "total_cost_usd": combined_cost if has_combined_cost else cost,
-                "total_tokens": tokens,
+                "cost_usd": inference_cost,
+                "total_tokens": _int_or_none(inference_tokens),
+                "normalizer_cost_usd": normalizer_cost,
+                "normalizer_tokens": _int_or_none(normalizer_tokens),
+                "evaluator_cost_usd": evaluator_cost,
+                "evaluator_tokens": _int_or_none(evaluator_tokens),
+                "pipeline_cost_usd": pipeline_cost,
+                "pipeline_tokens": _int_or_none(pipeline_tokens),
+                "run_cost_usd": run_cost,
+                "run_tokens": _int_or_none(run_tokens),
+                "total_cost_usd": run_cost,
                 "client_tool_executions": client_tool_executions,
                 "checks": summarize_checks(evaluation),
             }
         )
 
+    inference_cost, inference_tokens = _bucket_pair(buckets, "inference")
+    normalizer_cost, normalizer_tokens = _bucket_pair(buckets, "normalizer")
+    evaluator_cost, evaluator_tokens = _bucket_pair(buckets, "evaluator")
+    pipeline_cost, pipeline_tokens = _bucket_pair(buckets, "pipeline")
+    run_cost, run_tokens = _bucket_pair(buckets, "run")
     counts = summary.get("counts") if isinstance(summary.get("counts"), dict) else {}
     return {
         "suite_id": summary.get("suite_id") or run_dir.parent.name,
@@ -608,9 +648,17 @@ def enrich_run(summary: dict[str, Any], run_dir: Path) -> dict[str, Any]:
             "completed": counts.get("completed", 0),
         },
         "totals": {
-            "cost_usd": total_cost if has_cost else None,
-            "total_tokens": total_tokens if has_tokens else None,
+            "cost_usd": inference_cost,
+            "total_tokens": inference_tokens,
             "latency_ms": total_latency if has_latency else None,
+            "normalizer_cost_usd": normalizer_cost,
+            "normalizer_tokens": normalizer_tokens,
+            "evaluator_cost_usd": evaluator_cost,
+            "evaluator_tokens": evaluator_tokens,
+            "pipeline_cost_usd": pipeline_cost,
+            "pipeline_tokens": pipeline_tokens,
+            "run_cost_usd": run_cost,
+            "run_tokens": run_tokens,
         },
         "tests": tests_out,
     }
@@ -621,6 +669,7 @@ def load_test_detail(run_dir: Path, category_id: str, test_id: str, listing: dic
     evaluation = read_json(test_dir / "evaluation.json")
     metrics = read_json(test_dir / "metrics.json")
     normalizer_metrics = read_json(test_dir / "normalizer_metrics.json")
+    evaluator_metrics = read_json(test_dir / "evaluator_metrics.json")
     normalized = read_json(test_dir / "normalized.json")
     request = read_json(test_dir / "request.json")
     source = read_json(test_dir / "source.json")
@@ -654,6 +703,7 @@ def load_test_detail(run_dir: Path, category_id: str, test_id: str, listing: dic
         "schema_errors": schema_errors,
         "metrics": metrics,
         "normalizer_metrics": normalizer_metrics,
+        "evaluator_metrics": evaluator_metrics,
         "request": request,
         "response": response,
         "response_view": response_view,
@@ -664,8 +714,17 @@ def load_test_detail(run_dir: Path, category_id: str, test_id: str, listing: dic
         "wall_ms": (listing or {}).get("wall_ms"),
         "started_at_utc": (listing or {}).get("started_at_utc"),
         "cost_usd": (listing or {}).get("cost_usd"),
-        "total_cost_usd": (listing or {}).get("total_cost_usd"),
         "total_tokens": (listing or {}).get("total_tokens"),
+        "normalizer_cost_usd": (listing or {}).get("normalizer_cost_usd"),
+        "normalizer_tokens": (listing or {}).get("normalizer_tokens"),
+        "evaluator_cost_usd": (listing or {}).get("evaluator_cost_usd"),
+        "evaluator_tokens": (listing or {}).get("evaluator_tokens"),
+        "pipeline_cost_usd": (listing or {}).get("pipeline_cost_usd"),
+        "pipeline_tokens": (listing or {}).get("pipeline_tokens"),
+        "run_cost_usd": (listing or {}).get("run_cost_usd"),
+        "run_tokens": (listing or {}).get("run_tokens"),
+        "total_cost_usd": (listing or {}).get("total_cost_usd")
+        or (listing or {}).get("run_cost_usd"),
         "checks": (listing or {}).get("checks"),
         "client_tool_executions": (
             int(metrics["client_tool_executions"])

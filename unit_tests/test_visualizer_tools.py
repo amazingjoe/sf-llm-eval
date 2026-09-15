@@ -218,5 +218,83 @@ class LoadTestToolsTests(unittest.TestCase):
         )
 
 
+class EnrichRunCostTests(unittest.TestCase):
+    def _write_json(self, path: Path, data: dict) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+    def test_splits_inference_from_pipeline_costs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "harness_smoke" / "run1"
+            test_dir = run_dir / "lookup" / "account_001"
+            self._write_json(
+                test_dir / "metrics.json",
+                {"cost_usd": 0.10, "total_tokens": 100, "client_tool_executions": 1},
+            )
+            self._write_json(
+                test_dir / "normalizer_metrics.json",
+                {"cost_usd": 0.03, "total_tokens": 40, "latency_ms": 12},
+            )
+            self._write_json(
+                test_dir / "evaluator_metrics.json",
+                {"cost_usd": 0.02, "total_tokens": 20},
+            )
+            summary = {
+                "suite_id": "harness_smoke",
+                "suite_name": "Smoke",
+                "tests": [
+                    {
+                        "test_id": "account_001",
+                        "category_id": "lookup",
+                        "latency_ms": 50,
+                        "status": "pass",
+                        "score": 1.0,
+                    }
+                ],
+                "counts": {"total": 1, "pass": 1, "fail": 0, "error": 0, "completed": 0},
+            }
+            listing = viz.enrich_run(summary, run_dir)
+            test = listing["tests"][0]
+            self.assertAlmostEqual(test["cost_usd"], 0.10)
+            self.assertEqual(test["total_tokens"], 100)
+            self.assertAlmostEqual(test["normalizer_cost_usd"], 0.03)
+            self.assertEqual(test["normalizer_tokens"], 40)
+            self.assertAlmostEqual(test["evaluator_cost_usd"], 0.02)
+            self.assertEqual(test["evaluator_tokens"], 20)
+            self.assertAlmostEqual(test["pipeline_cost_usd"], 0.05)
+            self.assertEqual(test["pipeline_tokens"], 60)
+            self.assertAlmostEqual(test["run_cost_usd"], 0.15)
+            self.assertEqual(test["run_tokens"], 160)
+            totals = listing["totals"]
+            self.assertAlmostEqual(totals["cost_usd"], 0.10)
+            self.assertEqual(totals["total_tokens"], 100)
+            self.assertAlmostEqual(totals["pipeline_cost_usd"], 0.05)
+            self.assertAlmostEqual(totals["run_cost_usd"], 0.15)
+            self.assertEqual(totals["run_tokens"], 160)
+
+    def test_sample_run_model_cost_excludes_normalizer(self) -> None:
+        run_dir = (
+            ROOT / "runs" / "harness_smoke" / "20260911T202323.062455Z"
+        )
+        summary_path = run_dir / "summary.json"
+        if not summary_path.is_file():
+            self.skipTest("sample run not present")
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        listing = viz.enrich_run(summary, run_dir)
+        inference = 0.0
+        pipeline = 0.0
+        for test in listing["tests"]:
+            if test["pipeline_cost_usd"]:
+                self.assertGreater(test["run_cost_usd"], test["cost_usd"])
+            inference += test["cost_usd"] or 0
+            pipeline += test["pipeline_cost_usd"] or 0
+        self.assertAlmostEqual(listing["totals"]["cost_usd"], inference)
+        self.assertAlmostEqual(listing["totals"]["pipeline_cost_usd"] or 0, pipeline)
+        self.assertAlmostEqual(
+            listing["totals"]["run_cost_usd"],
+            inference + pipeline,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

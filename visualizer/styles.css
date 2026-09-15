@@ -650,6 +650,104 @@ main {
   margin-bottom: 22px;
 }
 
+.run-costs {
+  margin-top: 22px;
+  margin-bottom: 22px;
+}
+
+.run-costs > summary {
+  width: 100%;
+}
+
+.run-costs > .muted {
+  padding: 12px 16px 0;
+  margin: 0;
+}
+
+.run-costs .kv em {
+  display: block;
+  margin-top: 2px;
+  font-style: normal;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--mute);
+}
+
+.run-costs .cost-total b {
+  color: var(--accent);
+}
+
+.cost-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0;
+}
+
+.cost-table th,
+.cost-table td {
+  padding: 10px 16px;
+  border-top: 1px solid var(--line);
+  text-align: right;
+  vertical-align: top;
+}
+
+.cost-table th {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--mute);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.cost-table th:first-child,
+.cost-table td:first-child {
+  text-align: left;
+}
+
+.cost-table td b {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.cost-table td span {
+  display: block;
+  margin-top: 2px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--mute);
+}
+
+.cost-table td:first-child strong {
+  display: block;
+  font-size: 14px;
+}
+
+.cost-table tfoot td {
+  background: var(--surface-2);
+  font-weight: 600;
+}
+
+.cost-table tr.cost-category td {
+  background: var(--surface-2);
+}
+
+.cost-table tr.cost-test td:first-child {
+  padding-left: 28px;
+}
+
+@media (max-width: 720px) {
+  .run-costs {
+    overflow-x: auto;
+  }
+
+  .cost-table {
+    min-width: 520px;
+  }
+}
+
 .verdict h2 {
   font-family: var(--font-display);
   font-size: clamp(28px, 4vw, 44px);
@@ -726,6 +824,24 @@ code {
 .panels {
   display: grid;
   gap: 16px;
+}
+
+.pack {
+  margin-bottom: 22px;
+}
+
+.pack > .pack-body {
+  display: grid;
+  gap: 14px;
+  padding: 14px;
+  background: color-mix(in srgb, var(--paper) 55%, var(--surface-2));
+}
+
+.pack-body > .panel,
+.pack-body > .tools-panel,
+.pack-body > .fields-panel,
+.pack-body > .run-costs {
+  margin: 0;
 }
 
 .panel {

@@ -8,7 +8,7 @@ test:
     company's name, number of employees, and industry. Use the Salesforce
     query tool to look this up in the connected org.
   metadata:
-    category: salesforce_account_lookup
+    category: salesforce_record_operations
     difficulty: easy
     benchmark_group: crm_retrieval
     notes: >

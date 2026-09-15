@@ -4,9 +4,9 @@ suite:
   id: harness_smoke
   name: Harness smoke suite
   description: >
-    Runs the health-check, account-lookup, and web-search smoke tests
-    against a single OpenRouter model. Swap provider.model to benchmark a
-    different model without editing individual tests.
+    Runs the health-check, Salesforce record operations, and web-search
+    smoke tests against a single OpenRouter model. Swap provider.model to
+    benchmark a different model without editing individual tests.
 
 provider:
   endpoint: "https://openrouter.ai/api/v1/chat/completions"
@@ -28,11 +28,12 @@ categories:
     tests:
       - tests/harness_test.yaml
 
-  - id: salesforce_account_lookup
+  - id: salesforce_record_operations
     emoji: "🏢"
-    name: Salesforce account lookup
+    name: Salesforce record operations
     tests:
       - tests/acme_lookup.yaml
+      - tests/acme_object_discovery.yaml
 
   - id: web_search
     emoji: "🌐"

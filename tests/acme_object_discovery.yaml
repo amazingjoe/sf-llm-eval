@@ -1,0 +1,127 @@
+version: 1
+
+test:
+  id: object_discovery_001
+  name: Discover object and fields for Acme Incorporated
+  prompt: >
+    What line of business is Acme Incorporated in, and
+     how many people work there?
+
+     Return the sObject API name you queried, the field API names you
+     selected, the company name, the industry / line of business, and the
+     employee count.
+  metadata:
+    category: salesforce_record_operations
+    difficulty: medium
+    benchmark_group: crm_retrieval
+    notes: >
+      Exercises salesforce.describe plus salesforce.query. Requires a
+      connected Salesforce org (alias harness-org by default) that contains
+      an Account named Acme Incorporated with Industry and NumberOfEmployees
+      populated.
+
+# Subject model/provider come from the parent test-set.
+# Normalizer and evaluator models come from config.yaml.
+request:
+  system_prompt: >
+    You are an assistant working with Salesforce. Never guess field API
+    names. You may use salesforce_describe on a candidate sObject before writing
+    SOQL for it to determine the available fields. You may also then use salesforce_query with a selective SELECT.
+    Do not invent org data. Complete the user's task accurately and
+    concisely.
+
+  parameters:
+    temperature: 0
+    max_tokens: 800
+    top_p: 1
+
+  extra_payload: {}
+
+  headers:
+    X-Title: "Salesforce Open Model Benchmark - Object Discovery"
+
+  timeout_seconds: 180
+  max_rounds: 6
+
+  # Describe is required to confirm schema; query returns the record.
+  tools:
+    - salesforce.describe
+    - salesforce.query
+
+pipeline:
+  normalizer:
+    enabled: true
+    script: "normalizer.py"
+
+    parameters:
+      temperature: 0
+      max_tokens: 500
+
+    instructions: >
+      Extract only facts explicitly present in the subject model's answer.
+      Do not fix the answer, add outside knowledge, or infer missing values.
+      If a requested value is not present, use null. Field API names should
+      be the Salesforce API names as written by the model, not UI labels.
+
+    schema:
+      type: object
+      additionalProperties: false
+      required:
+        - object_api_name
+        - industry_field
+        - employee_count_field
+        - company_name
+        - number_of_employees
+        - industry
+      properties:
+        object_api_name:
+          type: ["string", "null"]
+        industry_field:
+          type: ["string", "null"]
+        employee_count_field:
+          type: ["string", "null"]
+        company_name:
+          type: ["string", "null"]
+        number_of_employees:
+          type: ["integer", "null"]
+        industry:
+          type: ["string", "null"]
+
+    extra_payload: {}
+    timeout_seconds: 120
+
+  evaluator:
+    enabled: true
+    script: "evaluator.py"
+    require_schema_valid: true
+
+    checks:
+      - name: Object API name is Account
+        field: object_api_name
+        op: case_insensitive_equals
+        expected: "Account"
+
+      - name: Industry field API name is Industry
+        field: industry_field
+        op: case_insensitive_equals
+        expected: "Industry"
+
+      - name: Employee-count field API name is NumberOfEmployees
+        field: employee_count_field
+        op: case_insensitive_equals
+        expected: "NumberOfEmployees"
+
+      - name: Company name is correct
+        field: company_name
+        op: case_insensitive_equals
+        expected: "Acme Incorporated"
+
+      - name: Employee count is correct
+        field: number_of_employees
+        op: numeric_equals
+        expected: 350
+
+      - name: Industry is correct
+        field: industry
+        op: case_insensitive_equals
+        expected: "Manufacturing"
