@@ -1,0 +1,61 @@
+name: Dependency Vulnerability Audit
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  dependency-audit:
+    name: Dependency Vulnerability Audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install audit tools and dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pip-audit
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+          if [ -f pyproject.toml ]; then
+            pip install . || true
+          fi
+
+      - name: Run pip-audit vulnerability scan
+        run: |
+          FAILED=0
+
+          if [ -f requirements.txt ]; then
+            echo "Auditing requirements.txt..."
+            pip-audit -r requirements.txt || FAILED=1
+          fi
+
+          if [ -f pyproject.toml ]; then
+            echo "Auditing pyproject.toml..."
+            pip-audit . || FAILED=1
+          fi
+
+          if [ ! -f requirements.txt ] && [ ! -f pyproject.toml ]; then
+            echo "Auditing installed Python environment..."
+            pip-audit || FAILED=1
+          fi
+
+          if [ "$FAILED" -ne 0 ]; then
+            echo "Security vulnerability audit failed: CVEs detected."
+            exit 1
+          fi

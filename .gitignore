@@ -36,3 +36,14 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
+# Certificates, private keys, and local credentials
+*.pem
+*.key
+*.crt
+*.cert
+*.p12
+*.pfx
+*.pkcs12
+*credentials*.json
+client_secret*.json
+
