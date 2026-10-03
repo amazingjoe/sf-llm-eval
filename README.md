@@ -37,6 +37,18 @@ copy .env.example .env   # Windows
 # cp .env.example .env   # macOS/Linux
 ```
 
+### Salesforce CLI setup (for Salesforce tests)
+
+If running benchmark tests that interact with Salesforce, authenticate your org using the default alias expected by `config.yaml`:
+
+```bash
+sf org login web --alias harness-org
+```
+
+> **Note:** The harness defaults to `alias: harness-org` in `config.yaml`. If you prefer to use an existing org alias, either change `salesforce.alias` in `config.yaml` or set `SF_ORG_ALIAS=<your-alias>` in `.env`.
+
+### Configuration
+
 Edit `.env`:
 
 ```text
@@ -48,13 +60,15 @@ Then edit:
 - `test-sets/harness_smoke.yaml` → `provider.model` (the model under test)
 - `config.yaml` → `normalizer.model` (stable extractor) and, when you need it, `evaluator.model` / `evaluator.mode`
 
+> **Note on `tests/` directory:** Test definitions in `tests/*.yaml` are user-defined and intentionally ignored by Git so you can define custom benchmarks, proprietary schemas, and org-specific prompts without committing them to source control.
+
 ## Who owns which model
 
 | Path | Owns |
 | --- | --- |
 | `config.yaml` | Normalizer model/provider. Evaluator mode (`deterministic` now, `judge` reserved) and judge model/provider for later. Salesforce CLI alias / optional org-id pin. |
 | `test-sets/*.yaml` | Suite name/description, subject model/provider, which tests run (grouped by category) |
-| `tests/*.yaml` | Prompt, expected answers, schema, temperature / max_tokens, tools |
+| `tests/*.yaml` | User-defined test files (ignored by Git): Prompt, expected answers, schema, temperature / max_tokens, tools |
 
 The same test file can be listed in multiple test-sets to compare models without copying prompts.
 

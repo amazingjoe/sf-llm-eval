@@ -1,7 +1,38 @@
-.env
+# Environment files (keep example tracked)
+.env*
+!.env.example
+
+# Local runs and cached artifacts
 runs/
-__pycache__/
-*.pyc
-.venv/
 .sf/
 .salesforce_schema_cache/
+
+# User-defined test definitions (preserve directory structure)
+tests/*
+!tests/.gitkeep
+
+# Temporary and build outputs
+tmp/
+output/
+
+# Python cache and virtual environments
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+
+# Testing and coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editor and OS files
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
