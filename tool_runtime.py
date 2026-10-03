@@ -163,5 +163,8 @@ def execute_client_tool(
             trace["sobject"] = payload.get("name")
         if "field_count" in payload:
             trace["field_count"] = payload.get("field_count")
+        cache = payload.get("cache")
+        if isinstance(cache, dict) and "hit" in cache:
+            trace["cache_hit"] = cache.get("hit")
     message = tool_message(call_id, payload, max_chars=context.max_tool_result_chars)
     return message, trace

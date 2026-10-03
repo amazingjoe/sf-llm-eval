@@ -46,6 +46,10 @@ salesforce:
   # This is not the payload sent back to the model.
   max_output_bytes: 8000000
   max_records: 200
+  # Persistent cache for read-only Salesforce schema metadata.
+  metadata_cache_dir: ".salesforce_schema_cache"
+  metadata_cache_ttl_hours: 48
+  metadata_cache_enabled: true
 
 logging:
   output_dir: "runs"

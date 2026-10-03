@@ -56,6 +56,7 @@ DESCRIBE_RESULT = {
     "result": {
         "name": "Account",
         "label": "Account",
+        "labelPlural": "Accounts",
         "keyPrefix": "001",
         "custom": False,
         "queryable": True,
@@ -63,24 +64,51 @@ DESCRIBE_RESULT = {
             {
                 "name": "Name",
                 "label": "Account Name",
+                "inlineHelpText": "The name of this account.",
                 "type": "string",
                 "nillable": False,
                 "custom": False,
                 "length": 255,
+                "nameField": True,
+                "filterable": True,
+                "sortable": True,
+                "groupable": True,
                 "picklistValues": [],
             },
             {
                 "name": "Industry",
                 "label": "Industry",
+                "inlineHelpText": "The industry in which the account operates.",
                 "type": "picklist",
                 "nillable": True,
+                "filterable": True,
+                "sortable": True,
+                "groupable": True,
+                "restrictedPicklist": True,
                 "picklistValues": [
                     {"value": "Manufacturing", "active": True},
                     {"value": "Other", "active": False},
                 ],
             },
         ],
+        "childRelationships": [
+            {
+                "childSObject": "Contact",
+                "field": "AccountId",
+                "relationshipName": "Contacts",
+            },
+            {
+                "childSObject": "ContentDocumentLink",
+                "field": "LinkedEntityId",
+                "relationshipName": None,
+            },
+        ],
     },
+}
+
+SOBJECT_LIST_RESULT = {
+    "status": 0,
+    "result": ["Account", "Contact", "Customer_Health__c"],
 }
 
 
@@ -107,14 +135,24 @@ class TranslateToolTests(unittest.TestCase):
         self.assertEqual(tool["type"], "function")
         self.assertEqual(tool["function"]["name"], "salesforce_query")
 
-    def test_salesforce_describe_and_org_info(self) -> None:
+    def test_salesforce_schema_tools_and_org_info(self) -> None:
         names = {
             translate_tool(key)["function"]["name"]
-            for key in ("salesforce.describe", "salesforce.org_info", "salesforce_query")
+            for key in (
+                "salesforce.describe",
+                "salesforce.list_sobjects",
+                "salesforce.org_info",
+                "salesforce_query",
+            )
         }
         self.assertEqual(
             names,
-            {"salesforce_describe", "salesforce_org_info", "salesforce_query"},
+            {
+                "salesforce_describe",
+                "salesforce_list_sobjects",
+                "salesforce_org_info",
+                "salesforce_query",
+            },
         )
 
     def test_write_tools_are_rejected(self) -> None:
@@ -183,6 +221,14 @@ class ParseAndSlimTests(unittest.TestCase):
         self.assertEqual(slim["field_count"], 2)
         industry = slim["fields"][1]
         self.assertEqual(industry["picklistValues"], ["Manufacturing"])
+        self.assertEqual(
+            industry["inlineHelpText"], "The industry in which the account operates."
+        )
+        self.assertTrue(industry["filterable"])
+        self.assertTrue(industry["restrictedPicklist"])
+        self.assertEqual(slim["labelPlural"], "Accounts")
+        self.assertEqual(slim["child_relationship_count"], 1)
+        self.assertEqual(slim["childRelationships"][0]["relationshipName"], "Contacts")
 
 
 class ProviderTests(unittest.TestCase):
@@ -266,6 +312,116 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(payload["name"], "Account")
         self.assertTrue(trace["ok"])
         self.assertEqual(payload["fields"][1]["picklistValues"], ["Manufacturing"])
+
+    def test_list_sobjects_via_handler(self) -> None:
+        provider = SalesforceCliProvider(_session())
+        with patch.object(provider, "run") as mocked:
+            mocked.return_value = type(
+                "Cli",
+                (),
+                {
+                    "argv": ["sf"],
+                    "returncode": 0,
+                    "stdout": "",
+                    "stderr": "",
+                    "data": SOBJECT_LIST_RESULT,
+                    "latency_ms": 1,
+                    "parse_error": None,
+                },
+            )()
+            context = ToolContext(salesforce=provider)
+            message, trace = execute_client_tool(
+                {
+                    "id": "call_3",
+                    "type": "function",
+                    "function": {
+                        "name": "salesforce_list_sobjects",
+                        "arguments": '{"category": "custom"}',
+                    },
+                },
+                context,
+            )
+        payload = json.loads(message["content"])
+        self.assertEqual(payload["category"], "custom")
+        self.assertEqual(payload["sobjects"], SOBJECT_LIST_RESULT["result"])
+        self.assertEqual(payload["returned"], 3)
+        self.assertTrue(trace["ok"])
+        argv = mocked.call_args.args[0]
+        self.assertEqual(argv, ["sobject", "list", "--sobject", "custom"])
+
+    def test_list_sobjects_rejects_unknown_category(self) -> None:
+        provider = SalesforceCliProvider(_session())
+        out = provider.list_sobjects("tooling")
+        self.assertIn("error", out)
+
+    def test_describe_cache_and_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            session = _session()
+            session.metadata_cache_dir = Path(tmp) / "cache"
+            provider = SalesforceCliProvider(session)
+            with patch.object(provider, "run") as mocked:
+                mocked.return_value = type(
+                    "Cli",
+                    (),
+                    {
+                        "argv": ["sf"],
+                        "returncode": 0,
+                        "stdout": "",
+                        "stderr": "",
+                        "data": DESCRIBE_RESULT,
+                        "latency_ms": 1,
+                        "parse_error": None,
+                    },
+                )()
+                first = provider.describe("Account")
+                cached = provider.describe("Account")
+                refreshed = provider.describe("Account", refresh=True)
+        self.assertFalse(first["cache"]["hit"])
+        self.assertTrue(cached["cache"]["hit"])
+        self.assertFalse(refreshed["cache"]["hit"])
+        self.assertEqual(mocked.call_count, 2)
+
+    def test_list_sobjects_cache_and_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            session = _session()
+            session.metadata_cache_dir = Path(tmp) / "cache"
+            provider = SalesforceCliProvider(session)
+            with patch.object(provider, "run") as mocked:
+                mocked.return_value = type(
+                    "Cli",
+                    (),
+                    {
+                        "argv": ["sf"],
+                        "returncode": 0,
+                        "stdout": "",
+                        "stderr": "",
+                        "data": SOBJECT_LIST_RESULT,
+                        "latency_ms": 1,
+                        "parse_error": None,
+                    },
+                )()
+                first = provider.list_sobjects("custom")
+                cached = provider.list_sobjects("custom")
+                refreshed = provider.list_sobjects("custom", refresh=True)
+        self.assertFalse(first["cache"]["hit"])
+        self.assertTrue(cached["cache"]["hit"])
+        self.assertFalse(refreshed["cache"]["hit"])
+        self.assertEqual(mocked.call_count, 2)
+
+    def test_schema_handlers_reject_non_boolean_refresh(self) -> None:
+        context = ToolContext(salesforce=SalesforceCliProvider(_session()))
+        message, trace = execute_client_tool(
+            {
+                "id": "call_bad_refresh",
+                "function": {
+                    "name": "salesforce_describe",
+                    "arguments": '{"sobject": "Account", "refresh": "true"}',
+                },
+            },
+            context,
+        )
+        self.assertIn("refresh must be a boolean", message["content"])
+        self.assertFalse(trace["ok"])
 
     def test_unknown_tool_returns_error_not_exception(self) -> None:
         message, trace = execute_client_tool(

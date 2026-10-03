@@ -1035,7 +1035,7 @@ code {
 
 .tool-head {
   display: grid;
-  grid-template-columns: 10px auto auto 1fr;
+  grid-template-columns: 10px auto auto auto 1fr;
   gap: 10px;
   align-items: center;
   padding: 12px 14px 10px;
@@ -1055,11 +1055,39 @@ code {
   color: var(--pass);
 }
 
+.cache-badge {
+  display: inline-flex;
+  align-items: center;
+  width: max-content;
+  min-height: 21px;
+  padding: 2px 7px;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  line-height: 1;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.cache-badge.is-hit {
+  color: var(--pass);
+  background: var(--pass-soft);
+}
+
+.cache-badge.is-miss {
+  color: var(--error);
+  background: var(--error-soft);
+}
+
 .tool-call.is-fail .tool-status {
   color: var(--fail);
 }
 
 .tool-stats {
+  grid-column: -1;
   font-family: var(--font-mono);
   font-size: 11px;
   color: var(--mute);
@@ -1506,7 +1534,7 @@ textarea:focus {
   }
 
   .tool-head {
-    grid-template-columns: 10px 1fr auto;
+    grid-template-columns: 10px 1fr auto auto;
   }
 
   .tool-stats {

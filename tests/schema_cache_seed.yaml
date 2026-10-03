@@ -1,0 +1,40 @@
+version: 1
+
+test:
+  id: schema_cache_seed_001
+  name: Seed the Salesforce schema cache
+  prompt: >
+    Run the required Salesforce schema discovery calls, then reply with a brief
+    confirmation that both completed.
+  metadata:
+    category: schema_cache_validation
+    difficulty: trivial
+    benchmark_group: manual_validation
+    notes: >
+      Forces live retrieval for both schema tools, establishing fresh entries
+      that the next test reads from cache.
+
+request:
+  system_prompt: >
+    Before answering, make exactly these two tool calls in order:
+    1. salesforce_list_sobjects with {"category":"custom","refresh":true}
+    2. salesforce_describe with {"sobject":"Account","refresh":true}
+    Do not call salesforce_query. After both calls, respond concisely.
+  parameters:
+    temperature: 0
+    max_tokens: 150
+    top_p: 1
+  extra_payload: {}
+  headers:
+    X-Title: "Salesforce Schema Cache - Seed"
+  timeout_seconds: 180
+  max_rounds: 4
+  tools:
+    - salesforce.list_sobjects
+    - salesforce.describe
+
+pipeline:
+  normalizer:
+    enabled: false
+  evaluator:
+    enabled: false

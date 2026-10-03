@@ -93,6 +93,20 @@ python runner.py --suite test-sets/harness_smoke.yaml --run-dir runs/harness_smo
 python runner.py --suite test-sets/harness_smoke.yaml --no-pipeline
 ```
 
+### Manual Salesforce schema-cache validation
+
+The dedicated suite runs three tests in order: a forced live seed, an ordinary
+warm read, and a forced refresh. It uses the isolated
+`.salesforce_schema_cache/manual_validation/` cache directory.
+
+```bash
+python runner.py --suite test-sets/schema_cache_manual.yaml --no-pipeline --yes
+```
+
+Inspect each test's `rounds/*/tool_results.json`. Both schema calls should have
+`cache_hit: false` in the seed test, `true` in the warm-read test, and `false`
+again in the forced-refresh test.
+
 ### Normalizer only
 
 Point it at a per-test run directory created by the runner:
@@ -247,6 +261,26 @@ Implemented shorthands:
 | `salesforce.query` | `salesforce_query` | `sf data query` |
 | `salesforce.org_info` | `salesforce_org_info` | `sf org display` |
 | `salesforce.describe` | `salesforce_describe` | `sf sobject describe` |
+| `salesforce.list_sobjects` | `salesforce_list_sobjects` | `sf sobject list` |
+
+`salesforce.list_sobjects` returns sObject API names from the connected org. Its
+optional `category` argument is `all` (the default), `standard`, or `custom`.
+Use `custom` to discover a non-standard object, then call
+`salesforce.describe` for the selected object before writing SOQL.
+
+`salesforce.describe` returns each field's API name, label, type, active
+picklist values, relationship targets, and `inlineHelpText` when Salesforce
+has field Help Text configured. It also includes SOQL capability flags such as
+`filterable`, `sortable`, and `groupable`, plus named child relationships for
+subqueries.
+
+Both schema tools use a persistent metadata cache by default. Entries are
+scoped to the connected org and user, live for 48 hours, and are stored in
+`.salesforce_schema_cache/` (ignored by Git). Pass `refresh: true` to either
+tool to bypass its cached value and replace it with a live Salesforce result.
+Configure the cache with `salesforce.metadata_cache_dir`,
+`salesforce.metadata_cache_ttl_hours`, or `salesforce.metadata_cache_enabled`
+in `config.yaml`.
 
 Not implemented (the test fails at load if you list them): Apex, metadata
 read/deploy, and data writes.

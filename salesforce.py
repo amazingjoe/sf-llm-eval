@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import shutil
@@ -9,7 +10,7 @@ import sys
 import time
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -20,9 +21,13 @@ DEFAULT_TIMEOUT_SECONDS = 120
 DEFAULT_LOGIN_TIMEOUT_SECONDS = 600
 DEFAULT_MAX_OUTPUT_BYTES = 8_000_000
 DEFAULT_MAX_RECORDS = 200
+DEFAULT_METADATA_CACHE_DIR = ".salesforce_schema_cache"
+DEFAULT_METADATA_CACHE_TTL_HOURS = 48
+METADATA_CACHE_VERSION = 2
 
 SOQL_SELECT = re.compile(r"^\s*select\b", re.IGNORECASE)
 SOBJECT_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+SOBJECT_CATEGORIES = {"all", "standard", "custom"}
 
 ORG_PUBLIC_FIELDS = (
     "id",
@@ -42,6 +47,7 @@ ORG_PUBLIC_FIELDS = (
 DESCRIBE_OBJECT_FIELDS = (
     "name",
     "label",
+    "labelPlural",
     "keyPrefix",
     "custom",
     "queryable",
@@ -54,6 +60,7 @@ DESCRIBE_OBJECT_FIELDS = (
 DESCRIBE_FIELD_FIELDS = (
     "name",
     "label",
+    "inlineHelpText",
     "type",
     "nillable",
     "custom",
@@ -64,9 +71,23 @@ DESCRIBE_FIELD_FIELDS = (
     "unique",
     "externalId",
     "calculated",
+    "defaultValue",
+    "defaultedOnCreate",
+    "nameField",
+    "filterable",
+    "sortable",
+    "groupable",
+    "restrictedPicklist",
+    "dependentPicklist",
+    "controllerName",
     "relationshipName",
     "referenceTo",
     "picklistValues",
+)
+DESCRIBE_CHILD_RELATIONSHIP_FIELDS = (
+    "childSObject",
+    "field",
+    "relationshipName",
 )
 
 
@@ -87,6 +108,9 @@ class SalesforceSession:
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
     max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES
     max_records: int = DEFAULT_MAX_RECORDS
+    metadata_cache_dir: Path | None = None
+    metadata_cache_ttl_hours: int = DEFAULT_METADATA_CACHE_TTL_HOURS
+    metadata_cache_enabled: bool = True
 
     def public_dict(self) -> dict[str, Any]:
         return {
@@ -159,6 +183,13 @@ def resolve_salesforce_settings(
         ),
         "max_output_bytes": int(merged.get("max_output_bytes") or DEFAULT_MAX_OUTPUT_BYTES),
         "max_records": int(merged.get("max_records") or DEFAULT_MAX_RECORDS),
+        "metadata_cache_dir": str(
+            merged.get("metadata_cache_dir") or DEFAULT_METADATA_CACHE_DIR
+        ),
+        "metadata_cache_ttl_hours": int(
+            merged.get("metadata_cache_ttl_hours") or DEFAULT_METADATA_CACHE_TTL_HOURS
+        ),
+        "metadata_cache_enabled": bool(merged.get("metadata_cache_enabled", True)),
     }
 
 
@@ -351,6 +382,9 @@ def session_from_identity(
         timeout_seconds=int(settings["timeout_seconds"]),
         max_output_bytes=int(settings["max_output_bytes"]),
         max_records=int(settings["max_records"]),
+        metadata_cache_dir=Path(str(settings["metadata_cache_dir"])),
+        metadata_cache_ttl_hours=int(settings["metadata_cache_ttl_hours"]),
+        metadata_cache_enabled=bool(settings["metadata_cache_enabled"]),
     )
 
 
@@ -507,6 +541,17 @@ def slim_describe(result: dict[str, Any]) -> dict[str, Any]:
             slim_fields.append(item)
     out["field_count"] = len(slim_fields)
     out["fields"] = slim_fields
+    child_relationships = result.get("childRelationships")
+    slim_child_relationships: list[dict[str, Any]] = []
+    if isinstance(child_relationships, list):
+        for relationship in child_relationships:
+            if not isinstance(relationship, dict):
+                continue
+            item = pick_fields(relationship, DESCRIBE_CHILD_RELATIONSHIP_FIELDS)
+            if item.get("relationshipName"):
+                slim_child_relationships.append(item)
+    out["child_relationship_count"] = len(slim_child_relationships)
+    out["childRelationships"] = slim_child_relationships
     return out
 
 
@@ -536,6 +581,74 @@ class SalesforceCliProvider:
             timeout_seconds=self.session.timeout_seconds,
             max_output_bytes=self.session.max_output_bytes,
         )
+
+    def _cache_path(self, kind: str, key: str) -> Path | None:
+        if not self.session.metadata_cache_enabled:
+            return None
+        cache_dir = self.session.metadata_cache_dir
+        if cache_dir is None:
+            return None
+        cache_identity = "\x00".join(
+            (
+                str(self.session.org_id or self.session.instance_url or self.session.alias),
+                str(self.session.username or "unknown-user"),
+                kind,
+                key,
+            )
+        )
+        digest = hashlib.sha256(cache_identity.encode("utf-8")).hexdigest()
+        return cache_dir / f"{kind}-{digest}.json"
+
+    def _read_metadata_cache(self, kind: str, key: str) -> tuple[dict[str, Any], str] | None:
+        path = self._cache_path(kind, key)
+        if path is None or not path.is_file():
+            return None
+        try:
+            cached = json.loads(path.read_text(encoding="utf-8"))
+            if cached.get("version") != METADATA_CACHE_VERSION:
+                return None
+            cached_at = datetime.fromisoformat(str(cached["cached_at"]))
+            payload = cached["payload"]
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+            return None
+        if cached_at.tzinfo is None:
+            return None
+        expires_at = cached_at + timedelta(
+            hours=self.session.metadata_cache_ttl_hours
+        )
+        if datetime.now(timezone.utc) >= expires_at or not isinstance(payload, dict):
+            return None
+        return payload, cached_at.isoformat()
+
+    def _write_metadata_cache(self, kind: str, key: str, payload: dict[str, Any]) -> str | None:
+        path = self._cache_path(kind, key)
+        if path is None:
+            return None
+        cached_at = datetime.now(timezone.utc).isoformat()
+        try:
+            write_json(
+                path,
+                {
+                    "version": METADATA_CACHE_VERSION,
+                    "cached_at": cached_at,
+                    "payload": payload,
+                },
+            )
+        except OSError:
+            return None
+        return cached_at
+
+    @staticmethod
+    def _with_cache_metadata(
+        payload: dict[str, Any], *, hit: bool, cached_at: str | None
+    ) -> dict[str, Any]:
+        return {
+            **payload,
+            "cache": {
+                "hit": hit,
+                "cached_at": cached_at,
+            },
+        }
 
     def org_info(self) -> dict[str, Any]:
         identity, result = display_org(
@@ -582,12 +695,20 @@ class SalesforceCliProvider:
             "truncated": truncated,
         }
 
-    def describe(self, sobject: str) -> dict[str, Any]:
+    def describe(self, sobject: str, *, refresh: bool = False) -> dict[str, Any]:
         name = (sobject or "").strip()
         if not name:
             return {"error": "sobject is required"}
         if not SOBJECT_NAME.match(name):
             return {"error": f"Invalid sObject name: {name}"}
+        cache_key = name.lower()
+        if not refresh:
+            cached = self._read_metadata_cache("describe", cache_key)
+            if cached is not None:
+                payload, cached_at = cached
+                return self._with_cache_metadata(
+                    payload, hit=True, cached_at=cached_at
+                )
         result = self.run(["sobject", "describe", "--sobject", name])
         if result.parse_error or result.returncode != 0:
             return cli_error_payload(result)
@@ -597,7 +718,48 @@ class SalesforceCliProvider:
         raw = data.get("result") if isinstance(data.get("result"), dict) else data
         if not isinstance(raw, dict):
             return {"error": "Describe returned no object information"}
-        return slim_describe(raw)
+        payload = slim_describe(raw)
+        cached_at = self._write_metadata_cache("describe", cache_key, payload)
+        return self._with_cache_metadata(payload, hit=False, cached_at=cached_at)
+
+    def list_sobjects(
+        self, category: str = "all", *, refresh: bool = False
+    ) -> dict[str, Any]:
+        requested_category = (category or "all").strip().lower()
+        if requested_category not in SOBJECT_CATEGORIES:
+            return {
+                "error": (
+                    "category must be one of: all, standard, custom"
+                )
+            }
+        if not refresh:
+            cached = self._read_metadata_cache("list_sobjects", requested_category)
+            if cached is not None:
+                payload, cached_at = cached
+                return self._with_cache_metadata(
+                    payload, hit=True, cached_at=cached_at
+                )
+        result = self.run(
+            ["sobject", "list", "--sobject", requested_category]
+        )
+        if result.parse_error or result.returncode != 0:
+            return cli_error_payload(result)
+        data = result.data if isinstance(result.data, dict) else {}
+        if data.get("status") not in (0, "0", None):
+            return cli_error_payload(result)
+        raw = data.get("result") if "result" in data else data
+        if not isinstance(raw, list):
+            return {"error": "Object list returned no sObjects"}
+        sobjects = [item for item in raw if isinstance(item, str)]
+        payload = {
+            "category": requested_category,
+            "sobjects": sobjects,
+            "returned": len(sobjects),
+        }
+        cached_at = self._write_metadata_cache(
+            "list_sobjects", requested_category, payload
+        )
+        return self._with_cache_metadata(payload, hit=False, cached_at=cached_at)
 
 
 def _require_provider(context: Any) -> SalesforceCliProvider | dict[str, Any]:
@@ -640,7 +802,26 @@ def handle_describe(args: dict[str, Any], context: Any) -> dict[str, Any]:
         return provider
     if not isinstance(args, dict):
         return {"error": "arguments must be an object"}
-    return provider.describe(str(args.get("sobject") or args.get("object") or ""))
+    refresh = args.get("refresh", False)
+    if not isinstance(refresh, bool):
+        return {"error": "refresh must be a boolean"}
+    return provider.describe(
+        str(args.get("sobject") or args.get("object") or ""), refresh=refresh
+    )
+
+
+def handle_list_sobjects(args: dict[str, Any], context: Any) -> dict[str, Any]:
+    provider = _require_provider(context)
+    if isinstance(provider, dict):
+        return provider
+    if not isinstance(args, dict):
+        return {"error": "arguments must be an object"}
+    refresh = args.get("refresh", False)
+    if not isinstance(refresh, bool):
+        return {"error": "refresh must be a boolean"}
+    return provider.list_sobjects(
+        str(args.get("category") or "all"), refresh=refresh
+    )
 
 
 SALESFORCE_SCHEMAS: dict[str, dict[str, Any]] = {
@@ -688,8 +869,9 @@ SALESFORCE_SCHEMAS: dict[str, dict[str, Any]] = {
         "function": {
             "name": "salesforce_describe",
             "description": (
-                "Describe a Salesforce sObject (fields, types, labels) in the "
-                "connected org. Use this before writing SOQL if you need schema."
+                "Describe a Salesforce sObject in the connected org, including "
+                "field labels, inline help text, SOQL capabilities, and child "
+                "relationships. Use this before writing SOQL if you need schema."
             ),
             "parameters": {
                 "type": "object",
@@ -698,9 +880,45 @@ SALESFORCE_SCHEMAS: dict[str, dict[str, Any]] = {
                     "sobject": {
                         "type": "string",
                         "description": "API name of the sObject, e.g. Account or MyThing__c.",
-                    }
+                    },
+                    "refresh": {
+                        "type": "boolean",
+                        "description": (
+                            "Bypass the metadata cache and refresh it from Salesforce."
+                        ),
+                    },
                 },
                 "required": ["sobject"],
+            },
+        },
+    },
+    "salesforce_list_sobjects": {
+        "type": "function",
+        "function": {
+            "name": "salesforce_list_sobjects",
+            "description": (
+                "List Salesforce sObject API names available in the connected org. "
+                "Use category custom to discover non-standard objects before "
+                "calling salesforce_describe or writing SOQL."
+            ),
+            "parameters": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "category": {
+                        "type": "string",
+                        "enum": ["all", "standard", "custom"],
+                        "description": (
+                            "Object category to return. Defaults to all."
+                        ),
+                    },
+                    "refresh": {
+                        "type": "boolean",
+                        "description": (
+                            "Bypass the metadata cache and refresh it from Salesforce."
+                        ),
+                    },
+                },
             },
         },
     },
@@ -710,6 +928,7 @@ SALESFORCE_HANDLERS: dict[str, Callable[[dict[str, Any], Any], dict[str, Any]]] 
     "salesforce_query": handle_query,
     "salesforce_org_info": handle_org_info,
     "salesforce_describe": handle_describe,
+    "salesforce_list_sobjects": handle_list_sobjects,
 }
 
 SALESFORCE_SHORTHAND: dict[str, str] = {
@@ -719,6 +938,8 @@ SALESFORCE_SHORTHAND: dict[str, str] = {
     "salesforce_org_info": "salesforce_org_info",
     "salesforce.describe": "salesforce_describe",
     "salesforce_describe": "salesforce_describe",
+    "salesforce.list_sobjects": "salesforce_list_sobjects",
+    "salesforce_list_sobjects": "salesforce_list_sobjects",
 }
 
 NOT_IMPLEMENTED_TOOLS: dict[str, str] = {

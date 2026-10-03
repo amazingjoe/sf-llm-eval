@@ -1,0 +1,35 @@
+version: 1
+
+suite:
+  id: schema_cache_manual
+  name: Salesforce schema-cache manual validation
+  description: >
+    Runs a live seed, warm-cache read, and forced refresh in order. Inspect the
+    recorded tool results to validate the cache behavior against a connected org.
+
+provider:
+  endpoint: "https://openrouter.ai/api/v1/chat/completions"
+  api_key: "${openrouter_key}"
+  model: "openai/gpt-5.6-luna"
+  headers:
+    X-Title: "Salesforce Schema Cache Manual Validation"
+  timeout_seconds: 120
+  extra_payload: {}
+
+# Keep manual-validation entries separate from benchmark-run metadata.
+salesforce:
+  metadata_cache_dir: ".salesforce_schema_cache/manual_validation"
+  metadata_cache_ttl_hours: 48
+  metadata_cache_enabled: true
+
+categories:
+  - id: schema_cache_validation
+    emoji: "🗃️"
+    name: Salesforce schema-cache validation
+    tests:
+      - tests/schema_cache_seed.yaml
+      - tests/schema_cache_warm.yaml
+      - tests/schema_cache_refresh.yaml
+
+logging:
+  output_dir: "runs"

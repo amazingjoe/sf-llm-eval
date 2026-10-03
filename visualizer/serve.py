@@ -375,6 +375,7 @@ def load_round_tools(round_dir: Path) -> dict[str, Any]:
                 "truncated": meta_row.get("truncated"),
                 "sobject": meta_row.get("sobject"),
                 "field_count": meta_row.get("field_count"),
+                "cache_hit": meta_row.get("cache_hit"),
                 "result": payload,
             }
         )
@@ -417,6 +418,7 @@ def load_round_tools(round_dir: Path) -> dict[str, Any]:
                     "truncated": None,
                     "sobject": None,
                     "field_count": None,
+                    "cache_hit": None,
                     "result": {
                         "sources": sources,
                         "search_requests": search_requests or (1 if sources else 0),

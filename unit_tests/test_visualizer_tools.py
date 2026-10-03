@@ -59,6 +59,7 @@ class LoadTestToolsTests(unittest.TestCase):
                             "returned": 1,
                             "total_size": 1,
                             "truncated": False,
+                            "cache_hit": True,
                         }
                     ]
                 ),
@@ -105,6 +106,7 @@ class LoadTestToolsTests(unittest.TestCase):
         self.assertEqual(call["arguments"]["query"], "SELECT Name FROM Account LIMIT 1")
         self.assertEqual(call["result"]["records"][0]["Name"], "Acme Incorporated")
         self.assertTrue(call["ok"])
+        self.assertTrue(call["cache_hit"])
 
     def test_real_account_lookup_run_if_present(self) -> None:
         run = (

@@ -568,6 +568,12 @@ function toolCallCard(call) {
   const failed = call.ok === false || Boolean(call.error);
   const search = isSearchCall(call);
   const preview = toolArgumentPreview(call);
+  const cacheBadge =
+    call.cache_hit === true
+      ? '<span class="cache-badge is-hit">cache hit</span>'
+      : call.cache_hit === false
+      ? '<span class="cache-badge is-miss">cache miss</span>'
+      : "";
   const stats = [];
   if (call.latency_ms != null) stats.push(formatMs(call.latency_ms));
   if (call.returned != null) {
@@ -592,6 +598,7 @@ function toolCallCard(call) {
       <span class="pip ${failed ? "fail" : "pass"}"></span>
       <strong>${escapeHtml(prettyToolName(call.name))}</strong>
       <span class="tool-status">${failed ? "error" : "ok"}</span>
+      ${cacheBadge}
       <span class="tool-stats">${escapeHtml(stats.join(" · ") || "")}</span>
     </div>
     ${

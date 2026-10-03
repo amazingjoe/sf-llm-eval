@@ -227,8 +227,16 @@ def run_inference_loop(
         executed: list[dict[str, Any]] = []
         for call in pending:
             name = tool_call_name(call)
-            print(f"  client tool: {name}")
             result_message, call_trace = execute_client_tool(call, tool_context)
+            cache_hit = call_trace.get("cache_hit")
+            cache_status = (
+                " (cache: hit)"
+                if cache_hit is True
+                else " (cache: miss)"
+                if cache_hit is False
+                else ""
+            )
+            print(f"  client tool: {name}{cache_status}")
             tool_messages.append(result_message)
             executed.append(call_trace)
             client_tool_executions += 1
