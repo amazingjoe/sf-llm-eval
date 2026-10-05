@@ -1,5 +1,7 @@
 # Salesforce Open-Model Benchmark Harness
 
+![Salesforce LLM Eval](assets/sf-llm-eval-social-preview.jpg)
+
 A small Python harness for benchmarking OpenRouter-hosted models on Salesforce-oriented tasks.
 
 Tests are model-agnostic. A **test-set** (suite) selects the tests to run and
