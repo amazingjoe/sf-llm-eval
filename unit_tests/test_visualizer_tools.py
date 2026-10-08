@@ -4,6 +4,7 @@ import json
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -296,6 +297,91 @@ class EnrichRunCostTests(unittest.TestCase):
             listing["totals"]["run_cost_usd"],
             inference + pipeline,
         )
+
+
+class BenchmarkTaskLibraryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name).resolve()
+        self.tasks = root / "benchmarks" / "tasks"
+        self.fixtures = root / "benchmarks" / "fixtures"
+        self.tasks.mkdir(parents=True)
+        self.fixtures.mkdir(parents=True)
+        for name, value in (
+            ("REPO_ROOT", root),
+            ("BENCHMARK_TASKS_DIR", self.tasks),
+            ("BENCHMARK_FIXTURES_DIR", self.fixtures),
+            ("TESTS_DIR", root / "tests"),
+            ("SUITES_DIR", root / "test-sets"),
+        ):
+            patcher = patch.object(viz, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def task(self, **test_overrides):
+        return {
+            "version": 1,
+            "test": {
+                "id": "lookup_001",
+                "name": "Lookup",
+                "prompt": "Which account owns the largest renewal?",
+                **test_overrides,
+            },
+            "request": {"system_prompt": "You are a test."},
+            "pipeline": {
+                "normalizer": {"schema": {"type": "object"}},
+                "evaluator": {"enabled": True, "script": "evaluator.py"},
+            },
+        }
+
+    def fixture(self, expected="Zephyrine Holdings"):
+        return {
+            "checks": [
+                {"name": "Account", "field": "account_name", "op": "equals", "expected": expected}
+            ]
+        }
+
+    def test_save_writes_task_and_fixture_separately(self) -> None:
+        saved = viz.save_benchmark_task("lookup_001.yaml", self.task(), self.fixture())
+        task_text = (self.tasks / "lookup_001.yaml").read_text(encoding="utf-8")
+        fixture_text = (self.fixtures / "lookup_001.yaml").read_text(encoding="utf-8")
+        self.assertNotIn("Zephyrine", task_text)
+        self.assertIn("fixture: ../fixtures/lookup_001.yaml", task_text)
+        self.assertIn("Zephyrine Holdings", fixture_text)
+        self.assertIn("test_id: lookup_001", fixture_text)
+        self.assertEqual(saved["fixture"]["path"], "benchmarks/fixtures/lookup_001.yaml")
+        self.assertEqual(saved["fixture"]["data"]["checks"][0]["expected"], "Zephyrine Holdings")
+
+    def test_listing_marks_benchmark_tasks(self) -> None:
+        viz.save_benchmark_task("lookup_001.yaml", self.task(), self.fixture())
+        items = viz.list_tests()
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["source"], "benchmarks")
+        self.assertEqual(items[0]["path"], "benchmarks/tasks/lookup_001.yaml")
+        self.assertEqual(items[0]["check_count"], 1)
+
+    def test_save_rejects_answer_in_success_criteria(self) -> None:
+        data = self.task(success_criteria="Mention Zephyrine Holdings.")
+        with self.assertRaisesRegex(ValueError, "fixture values"):
+            viz.save_benchmark_task("lookup_001.yaml", data, self.fixture())
+        self.assertFalse((self.tasks / "lookup_001.yaml").exists())
+        self.assertFalse((self.fixtures / "lookup_001.yaml").exists())
+
+    def test_save_rejects_inline_checks(self) -> None:
+        data = self.task()
+        data["pipeline"]["evaluator"]["checks"] = [{"field": "x", "expected": 1}]
+        with self.assertRaisesRegex(ValueError, "must not contain expected values"):
+            viz.save_benchmark_task("lookup_001.yaml", data, self.fixture())
+
+    def test_save_rejects_fixture_outside_fixtures_dir(self) -> None:
+        data = self.task(fixture="../../tests/lookup_001.yaml")
+        with self.assertRaisesRegex(ValueError, "benchmarks/fixtures"):
+            viz.save_benchmark_task("lookup_001.yaml", data, self.fixture())
+
+    def test_save_requires_fixture_checks(self) -> None:
+        with self.assertRaisesRegex(ValueError, "checks must be a non-empty list"):
+            viz.save_benchmark_task("lookup_001.yaml", self.task(), {"checks": []})
 
 
 if __name__ == "__main__":

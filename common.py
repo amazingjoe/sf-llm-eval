@@ -30,6 +30,18 @@ SERVER_TOOL_SHORTHAND = {
 DEFAULT_MAX_TOOL_CALLS = 8
 DEFAULT_MAX_ROUNDS = 8
 
+# Finish signal. The subject calls this in the same message as its final answer.
+FINISH_SHORTHAND = "benchmark.finish"
+FINISH_FUNCTION = "benchmark_finish"
+FINISH_STATUSES = ("answered", "not_found", "declined")
+# Appended to the system prompt by the harness when completion.required is true.
+# Identical for every task and model.
+FINISH_INSTRUCTION = (
+    "When you give your final answer to the user, call the benchmark_finish tool "
+    "in that same message. Set status to answered, not_found, or declined. "
+    "The text of that message is the answer the user receives."
+)
+
 
 def load_yaml_object(path: str | Path) -> dict[str, Any]:
     path = Path(path).resolve()
@@ -117,6 +129,8 @@ def load_test_file(
 
     load_env_near(*env_roots)
     raw = load_yaml_object(path)
+    if is_benchmark_task(raw):
+        validate_benchmark_task(raw, path)
 
     if raw_suite is not None:
         ensure_test_does_not_define_owned_provider_fields(raw, path)
@@ -140,7 +154,262 @@ def load_test_file(
             hint=f"Add {CONFIG_FILENAME} at the project root, or pass --config.",
         )
 
+    raw = apply_completion_settings(raw)
+    validate_tool_limits(raw, path)
     return raw, resolve_env(raw)
+
+
+def tool_function_name(entry: Any) -> str | None:
+    """Function name the model calls for a tool entry; None for server tools."""
+    tool = translate_tool(entry)
+    if tool_kind(tool) == "server":
+        return None
+    function = tool.get("function") if isinstance(tool.get("function"), dict) else {}
+    return str(function.get("name") or "") or None
+
+
+def tool_limits(cfg: dict[str, Any]) -> dict[str, int]:
+    """Graded per-tool call ceilings, keyed by function name. Empty means count only."""
+    limits: dict[str, int] = {}
+    for key, spec in (cfg.get("tool_limits") or {}).items():
+        name = tool_function_name(str(key))
+        if name:
+            limits[name] = int(spec["max_calls"])
+    return limits
+
+
+def validate_tool_limits(raw: dict[str, Any], path: str | Path) -> None:
+    """tool_limits: {<tool>: {max_calls: N}} with N a positive integer, for offered tools."""
+    path = Path(path)
+    limits = raw.get("tool_limits")
+    if limits is None:
+        return
+    if not isinstance(limits, dict):
+        raise ValueError(f"{path}: tool_limits must be a mapping of tool name to limits")
+    offered = {
+        tool_function_name(tool) for tool in (raw.get("request") or {}).get("tools") or []
+    }
+    for key, spec in limits.items():
+        try:
+            name = tool_function_name(str(key))
+        except ValueError as exc:
+            raise ValueError(f"{path}: tool_limits.{key}: {exc}") from exc
+        if name is None:
+            raise ValueError(f"{path}: tool_limits.{key}: only client tools can be limited")
+        if name == FINISH_FUNCTION:
+            raise ValueError(f"{path}: tool_limits.{key}: the finish tool cannot be limited")
+        if name not in offered:
+            raise ValueError(
+                f"{path}: tool_limits.{key} names a tool this test does not offer"
+            )
+        max_calls = spec.get("max_calls") if isinstance(spec, dict) else None
+        if isinstance(max_calls, bool) or not isinstance(max_calls, int) or max_calls < 1:
+            raise ValueError(
+                f"{path}: tool_limits.{key}.max_calls must be a positive integer. "
+                "Omit tool_limits to only count calls."
+            )
+
+
+def completion_required(cfg: dict[str, Any]) -> bool:
+    return bool((cfg.get("completion") or {}).get("required"))
+
+
+def is_finish_tool_entry(entry: Any) -> bool:
+    if isinstance(entry, str):
+        return entry.strip() in (FINISH_SHORTHAND, FINISH_FUNCTION)
+    if isinstance(entry, dict):
+        function = entry.get("function") if isinstance(entry.get("function"), dict) else {}
+        return entry.get("type") == FINISH_SHORTHAND or function.get("name") == FINISH_FUNCTION
+    return False
+
+
+def apply_completion_settings(raw: dict[str, Any]) -> dict[str, Any]:
+    """Offer the finish tool and its fixed instruction when completion is required."""
+    if not completion_required(raw):
+        return raw
+    merged = deepcopy(raw)
+    request = merged.setdefault("request", {})
+    tools = list(request.get("tools") or [])
+    if not any(is_finish_tool_entry(tool) for tool in tools):
+        tools.append(FINISH_SHORTHAND)
+    request["tools"] = tools
+    system_prompt = str(request.get("system_prompt") or "").rstrip()
+    if FINISH_INSTRUCTION not in system_prompt:
+        request["system_prompt"] = (
+            f"{system_prompt}\n\n{FINISH_INSTRUCTION}" if system_prompt else FINISH_INSTRUCTION
+        )
+    return merged
+
+
+def is_benchmark_task(raw: dict[str, Any]) -> bool:
+    """A benchmark task keeps its answer key in a separate fixture file."""
+    return bool((raw.get("test") or {}).get("fixture"))
+
+
+def resolve_fixture_path(task_path: str | Path, ref: str | Path) -> Path:
+    candidate = Path(ref)
+    if candidate.is_absolute():
+        return candidate
+    return (Path(task_path).resolve().parent / candidate).resolve()
+
+
+def load_fixture_file(path: str | Path) -> dict[str, Any]:
+    """Load an evaluator-only fixture. Never pass its contents to the model."""
+    path = Path(path).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Fixture not found: {path}")
+    raw = load_yaml_object(path)
+    validate_fixture(raw, path)
+    return raw
+
+
+def validate_fixture(raw: dict[str, Any], path: str | Path) -> None:
+    path = Path(path)
+    if not str(raw.get("test_id") or "").strip():
+        raise ValueError(f"{path}: test_id is required")
+    checks = raw.get("checks")
+    if not isinstance(checks, list) or not checks:
+        raise ValueError(f"{path}: checks must be a non-empty list")
+    for index, check in enumerate(checks):
+        if not isinstance(check, dict) or not check.get("field"):
+            raise ValueError(f"{path}: checks[{index}] must be a mapping with a field")
+        if "expected" not in check:
+            raise ValueError(f"{path}: checks[{index}] must set expected")
+
+
+def fixture_for_test(
+    raw_test: dict[str, Any], task_path: str | Path
+) -> tuple[Path, dict[str, Any]] | None:
+    """Return (path, fixture) for a benchmark task, or None for a legacy test."""
+    ref = (raw_test.get("test") or {}).get("fixture")
+    if not ref:
+        return None
+    fixture_path = resolve_fixture_path(task_path, str(ref))
+    return fixture_path, load_fixture_file(fixture_path)
+
+
+def find_expected_keys(value: Any, prefix: str = "") -> list[str]:
+    """Dotted paths of answer-key fields: `expected`, `expected_*`, evaluator checks."""
+    found: list[str] = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            dotted = f"{prefix}.{key}" if prefix else str(key)
+            if dotted == "pipeline.normalizer.schema":
+                # Schema property names describe the answer shape, not its values.
+                continue
+            key_text = str(key)
+            if (
+                key_text == "expected"
+                or key_text.startswith("expected_")
+                or dotted == "pipeline.evaluator.checks"
+            ):
+                found.append(dotted)
+                continue
+            found.extend(find_expected_keys(child, dotted))
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            found.extend(find_expected_keys(child, f"{prefix}[{index}]"))
+    return found
+
+
+def model_visible_texts(raw_test: dict[str, Any]) -> dict[str, str]:
+    """Every task field runner.py sends to the subject model."""
+    test = raw_test.get("test") or {}
+    request = raw_test.get("request") or {}
+    texts = {
+        "test.prompt": test.get("prompt"),
+        "test.success_criteria": test.get("success_criteria"),
+        "request.system_prompt": request.get("system_prompt"),
+    }
+    for index, message in enumerate(request.get("messages") or []):
+        if isinstance(message, dict):
+            texts[f"request.messages[{index}].content"] = message.get("content")
+    return {key: text for key, text in texts.items() if isinstance(text, str)}
+
+
+def schema_vocabulary(schema: Any) -> set[str]:
+    """Enum/const strings in the normalizer schema. These are public, not answers."""
+    words: set[str] = set()
+    if isinstance(schema, dict):
+        for key, child in schema.items():
+            if key == "enum" and isinstance(child, list):
+                words.update(str(item).casefold() for item in child if isinstance(item, str))
+            elif key == "const" and isinstance(child, str):
+                words.add(child.casefold())
+            else:
+                words.update(schema_vocabulary(child))
+    elif isinstance(schema, list):
+        for child in schema:
+            words.update(schema_vocabulary(child))
+    return words
+
+
+def fixture_string_values(fixture: dict[str, Any]) -> list[str]:
+    values: list[str] = []
+    for check in fixture.get("checks") or []:
+        expected = check.get("expected")
+        items = expected if isinstance(expected, list) else [expected]
+        values.extend(item for item in items if isinstance(item, str) and item.strip())
+    return values
+
+
+def find_fixture_leaks(
+    raw_test: dict[str, Any], fixture: dict[str, Any]
+) -> list[tuple[str, str]]:
+    """(task field, fixture value) pairs where an answer appears in model-visible text."""
+    schema = ((raw_test.get("pipeline") or {}).get("normalizer") or {}).get("schema")
+    public = schema_vocabulary(schema)
+    leaks: list[tuple[str, str]] = []
+    texts = {key: text.casefold() for key, text in model_visible_texts(raw_test).items()}
+    for value in fixture_string_values(fixture):
+        needle = value.strip().casefold()
+        if needle in public:
+            continue
+        pattern = re.compile(rf"(?<!\w){re.escape(needle)}(?!\w)")
+        for key, text in texts.items():
+            if pattern.search(text):
+                leaks.append((key, value))
+    return leaks
+
+
+def validate_benchmark_task(raw: dict[str, Any], path: str | Path) -> None:
+    """Reject a benchmark task that carries or leaks its own answer key."""
+    path = Path(path).resolve()
+    expected_keys = find_expected_keys(raw)
+    if expected_keys:
+        raise ValueError(
+            f"{path}: benchmark tasks must not contain expected values "
+            f"({', '.join(expected_keys)}). Move them to the fixture file."
+        )
+
+    loaded = fixture_for_test(raw, path)
+    assert loaded is not None
+    fixture_path, fixture = loaded
+    check_task_against_fixture(raw, path, fixture, fixture_path)
+
+
+def check_task_against_fixture(
+    raw: dict[str, Any],
+    path: str | Path,
+    fixture: dict[str, Any],
+    fixture_path: str | Path,
+) -> None:
+    """Fixture belongs to this task, and the task text does not reveal it."""
+    path = Path(path)
+    test_id = str((raw.get("test") or {}).get("id") or "")
+    if str(fixture.get("test_id")) != test_id:
+        raise ValueError(
+            f"{fixture_path}: test_id '{fixture.get('test_id')}' does not match "
+            f"task test.id '{test_id}' in {path}"
+        )
+
+    leaks = find_fixture_leaks(raw, fixture)
+    if leaks:
+        details = ", ".join(f"{key} contains {value!r}" for key, value in leaks)
+        raise ValueError(
+            f"{path}: model-visible text contains fixture values ({details}). "
+            "Reword the task so it does not reveal the answer."
+        )
 
 
 def validate_config(raw: dict[str, Any], path: str | Path) -> None:

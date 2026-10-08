@@ -1,0 +1,31 @@
+version: 1
+
+suite:
+  id: benchmark_health
+  name: Benchmark health suite
+  description: >
+    Runs the committed benchmark health checks (task + fixture format)
+    against a single OpenRouter model. Needs no Salesforce org.
+
+provider:
+  endpoint: "https://openrouter.ai/api/v1/chat/completions"
+  api_key: "${openrouter_key}"
+
+  # Replace with the OpenRouter model slug you want to benchmark.
+  model: "anthropic/claude-haiku-5.5"
+
+  headers:
+    X-Title: "Salesforce Open Model Benchmark"
+
+  timeout_seconds: 120
+  extra_payload: {}
+
+categories:
+  - id: harness_health_check
+    emoji: "🧪"
+    name: Harness health checks
+    tests:
+      - benchmarks/tasks/harness_arithmetic_001.yaml
+
+logging:
+  output_dir: "runs"

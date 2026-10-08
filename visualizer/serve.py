@@ -17,6 +17,8 @@ ROOT = Path(__file__).resolve().parent
 REPO_ROOT = ROOT.parent
 DEFAULT_RUNS = REPO_ROOT / "runs"
 TESTS_DIR = REPO_ROOT / "tests"
+BENCHMARK_TASKS_DIR = REPO_ROOT / "benchmarks" / "tasks"
+BENCHMARK_FIXTURES_DIR = REPO_ROOT / "benchmarks" / "fixtures"
 SUITES_DIR = REPO_ROOT / "test-sets"
 CONFIG_PATH = REPO_ROOT / "config.yaml"
 FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*\.ya?ml$")
@@ -33,14 +35,20 @@ except ImportError:  # pragma: no cover - optional for display names
 
 try:
     from common import (
+        check_task_against_fixture,
         ensure_test_does_not_define_owned_provider_fields,
+        find_expected_keys,
         validate_config,
+        validate_fixture,
         validate_suite,
     )
 except ImportError:
     validate_config = None
     validate_suite = None
     ensure_test_does_not_define_owned_provider_fields = None
+    check_task_against_fixture = None
+    find_expected_keys = None
+    validate_fixture = None
 
 
 def read_json(path: Path) -> Any | None:
@@ -496,6 +504,23 @@ def _metric_number(blob: Any, key: str) -> float | None:
     return None
 
 
+def read_normalizer_metrics(test_dir: Path) -> dict[str, Any] | None:
+    """Graded normalizer metrics plus the delivery (transcript) pass, if it ran."""
+    graded = read_json(test_dir / "normalizer_metrics.json")
+    delivery = read_json(test_dir / "normalizer_transcript_metrics.json")
+    if not isinstance(delivery, dict):
+        return graded
+    if not isinstance(graded, dict):
+        graded = {}
+    merged = dict(graded)
+    for key in ("cost_usd", "total_tokens", "prompt_tokens", "completion_tokens", "latency_ms"):
+        total = _sum_known(_metric_number(graded, key), _metric_number(delivery, key))
+        if total is not None:
+            merged[key] = total
+    merged["delivery_pass"] = delivery
+    return merged
+
+
 def _sum_known(*values: float | None) -> float | None:
     present = [value for value in values if value is not None]
     if not present:
@@ -541,7 +566,7 @@ def enrich_run(summary: dict[str, Any], run_dir: Path) -> dict[str, Any]:
         category_id = str(item.get("category_id") or "")
         test_dir = run_dir / category_id / test_id if category_id and test_id else None
         metrics = read_json(test_dir / "metrics.json") if test_dir else None
-        normalizer_metrics = read_json(test_dir / "normalizer_metrics.json") if test_dir else None
+        normalizer_metrics = read_normalizer_metrics(test_dir) if test_dir else None
         evaluator_metrics = read_json(test_dir / "evaluator_metrics.json") if test_dir else None
         evaluation = read_json(test_dir / "evaluation.json") if test_dir else None
         source = read_json(test_dir / "source.json") if test_dir else None
@@ -670,7 +695,7 @@ def load_test_detail(run_dir: Path, category_id: str, test_id: str, listing: dic
     test_dir = run_dir / category_id / test_id
     evaluation = read_json(test_dir / "evaluation.json")
     metrics = read_json(test_dir / "metrics.json")
-    normalizer_metrics = read_json(test_dir / "normalizer_metrics.json")
+    normalizer_metrics = read_normalizer_metrics(test_dir)
     evaluator_metrics = read_json(test_dir / "evaluator_metrics.json")
     normalized = read_json(test_dir / "normalized.json")
     request = read_json(test_dir / "request.json")
@@ -850,19 +875,31 @@ def yaml_files(directory: Path) -> list[Path]:
     )
 
 
-def test_summary(path: Path) -> dict[str, Any]:
+def test_summary(path: Path, source: str = "tests") -> dict[str, Any]:
     loaded = load_yaml(path) or {}
     test = loaded.get("test") if isinstance(loaded.get("test"), dict) else {}
     metadata = test.get("metadata") if isinstance(test.get("metadata"), dict) else {}
-    evaluator = (
-        ((loaded.get("pipeline") or {}).get("evaluator") or {})
-        if isinstance(loaded.get("pipeline"), dict)
-        else {}
-    )
-    checks = evaluator.get("checks") if isinstance(evaluator.get("checks"), list) else []
+    if source == "benchmarks":
+        fixture = None
+        try:
+            fixture = load_yaml(fixture_path_for(path.name, test.get("fixture")))
+        except ValueError:
+            pass
+        checks = (fixture or {}).get("checks") if isinstance(fixture, dict) else []
+        checks = checks if isinstance(checks, list) else []
+        rel = f"benchmarks/tasks/{path.name}"
+    else:
+        evaluator = (
+            ((loaded.get("pipeline") or {}).get("evaluator") or {})
+            if isinstance(loaded.get("pipeline"), dict)
+            else {}
+        )
+        checks = evaluator.get("checks") if isinstance(evaluator.get("checks"), list) else []
+        rel = f"tests/{path.name}"
     return {
         "filename": path.name,
-        "path": f"tests/{path.name}",
+        "source": source,
+        "path": rel,
         "test_id": test.get("id"),
         "name": test.get("name"),
         "category": metadata.get("category"),
@@ -896,8 +933,10 @@ def suite_summary(path: Path) -> dict[str, Any]:
 def list_tests() -> list[dict[str, Any]]:
     suites = [suite_summary(path) for path in yaml_files(SUITES_DIR)]
     items = []
-    for path in yaml_files(TESTS_DIR):
-        item = test_summary(path)
+    sources = [("benchmarks", path) for path in yaml_files(BENCHMARK_TASKS_DIR)]
+    sources += [("tests", path) for path in yaml_files(TESTS_DIR)]
+    for source, path in sources:
+        item = test_summary(path, source)
         used_in = []
         for suite_path in yaml_files(SUITES_DIR):
             text = read_text(suite_path) or ""
@@ -931,7 +970,71 @@ def load_named_yaml(directory: Path, filename: str, kind: str) -> dict[str, Any]
     }
 
 
-def validate_test_definition(raw: dict[str, Any], path: Path) -> None:
+def fixture_path_for(task_filename: str, ref: Any = None) -> Path:
+    """Resolve a task's fixture ref. It must stay inside benchmarks/fixtures/."""
+    ref = str(ref or f"../fixtures/{task_filename}")
+    target = (BENCHMARK_TASKS_DIR / ref).resolve()
+    if target.parent != BENCHMARK_FIXTURES_DIR.resolve():
+        raise ValueError("test.fixture must point at a file in benchmarks/fixtures/.")
+    safe_filename(target.name)
+    return target
+
+
+def load_benchmark_task(filename: str) -> dict[str, Any]:
+    doc = load_named_yaml(BENCHMARK_TASKS_DIR, filename, "benchmark task")
+    test = doc["data"].get("test") if isinstance(doc["data"].get("test"), dict) else {}
+    fixture_path = fixture_path_for(doc["filename"], test.get("fixture"))
+    fixture = None
+    if fixture_path.is_file():
+        text = read_text(fixture_path) or ""
+        fixture = {
+            "filename": fixture_path.name,
+            "path": str(fixture_path.relative_to(REPO_ROOT)).replace("\\", "/"),
+            "text": text,
+            "data": parse_yaml_text(text),
+        }
+    doc["source"] = "benchmarks"
+    doc["fixture"] = fixture
+    return doc
+
+
+def save_benchmark_task(
+    filename: str, data: dict[str, Any], fixture: dict[str, Any]
+) -> dict[str, Any]:
+    """Validate the task and its fixture together, then write both."""
+    task_path = BENCHMARK_TASKS_DIR / safe_filename(filename)
+    test = data.get("test")
+    if not isinstance(test, dict):
+        raise ValueError("test must be a mapping")
+    test["fixture"] = test.get("fixture") or f"../fixtures/{task_path.name}"
+    fixture_path = fixture_path_for(task_path.name, test["fixture"])
+    if not isinstance(fixture, dict):
+        raise ValueError("Body must include a fixture object.")
+    fixture = {
+        "version": fixture.get("version") or 1,
+        **fixture,
+        "test_id": str(test.get("id") or "").strip(),
+    }
+    validate_test_definition(data, task_path, require_checks=False)
+    if find_expected_keys is not None:
+        expected_keys = find_expected_keys(data)
+        if expected_keys:
+            raise ValueError(
+                "Benchmark tasks must not contain expected values "
+                f"({', '.join(expected_keys)}). Put checks in the fixture."
+            )
+    if validate_fixture is not None:
+        validate_fixture(fixture, fixture_path)
+    if check_task_against_fixture is not None:
+        check_task_against_fixture(data, task_path, fixture, fixture_path)
+    write_text(fixture_path, dump_yaml(fixture))
+    write_text(task_path, dump_yaml(data))
+    return load_benchmark_task(task_path.name)
+
+
+def validate_test_definition(
+    raw: dict[str, Any], path: Path, require_checks: bool = True
+) -> None:
     test = raw.get("test")
     if not isinstance(test, dict) or not str(test.get("id") or "").strip():
         raise ValueError("test.id is required")
@@ -943,7 +1046,7 @@ def validate_test_definition(raw: dict[str, Any], path: Path) -> None:
         ensure_test_does_not_define_owned_provider_fields(raw, path)
     pipeline = raw.get("pipeline") if isinstance(raw.get("pipeline"), dict) else {}
     evaluator = pipeline.get("evaluator") if isinstance(pipeline.get("evaluator"), dict) else {}
-    if evaluator.get("enabled", True):
+    if require_checks and evaluator.get("enabled", True):
         checks = evaluator.get("checks")
         if not isinstance(checks, list) or not checks:
             raise ValueError("pipeline.evaluator.checks must list one or more checks")
@@ -1058,6 +1161,16 @@ class VisualizerHandler(BaseHTTPRequestHandler):
             self._send_json({"suites": list_suites()})
             return
 
+        if path.startswith("/api/benchmarks/"):
+            filename = path.split("/", 3)[-1]
+            try:
+                self._send_json(load_benchmark_task(unquote(filename)))
+            except ValueError as exc:
+                self._send_error_json(400, str(exc))
+            except FileNotFoundError:
+                self._send_error_json(404, "Benchmark task not found.")
+            return
+
         if path.startswith("/api/suites/"):
             filename = path.split("/", 3)[-1]
             try:
@@ -1129,6 +1242,11 @@ class VisualizerHandler(BaseHTTPRequestHandler):
                 saved = save_named_yaml(TESTS_DIR, unquote(filename), data, "test")
                 self._send_json(saved)
                 return
+            if path.startswith("/api/benchmarks/"):
+                filename = path.split("/", 3)[-1]
+                saved = save_benchmark_task(unquote(filename), data, payload.get("fixture"))
+                self._send_json(saved)
+                return
             if path.startswith("/api/suites/"):
                 filename = path.split("/", 3)[-1]
                 saved = save_named_yaml(SUITES_DIR, unquote(filename), data, "suite")
@@ -1144,11 +1262,17 @@ class VisualizerHandler(BaseHTTPRequestHandler):
         self._send_error_json(404, "Unknown API path.")
 
     def _serve_static(self, path: str) -> None:
-        relative = "index.html" if path in {"", "/"} else path.lstrip("/")
-        target = (self.static_dir / relative).resolve()
-        if self.static_dir.resolve() not in target.parents and target != self.static_dir.resolve():
-            self._send_error_json(403, "Forbidden.")
-            return
+        if path.startswith("/assets/"):
+            target = (self.repo_root / path.lstrip("/")).resolve()
+            if self.repo_root.resolve() not in target.parents:
+                self._send_error_json(403, "Forbidden.")
+                return
+        else:
+            relative = "index.html" if path in {"", "/"} else path.lstrip("/")
+            target = (self.static_dir / relative).resolve()
+            if self.static_dir.resolve() not in target.parents and target != self.static_dir.resolve():
+                self._send_error_json(403, "Forbidden.")
+                return
         if target.is_dir():
             target = target / "index.html"
         if not target.is_file():
@@ -1179,6 +1303,13 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if yaml is None:
+        raise SystemExit(
+            f"PyYAML is not installed for {sys.executable}.\n"
+            "Run the workbench with the project virtualenv, for example:\n"
+            "  .venv/bin/python visualizer/serve.py\n"
+            "or install dependencies with: pip install -r requirements.txt"
+        )
     runs_dir = Path(args.runs).resolve()
     VisualizerHandler.runs_dir = runs_dir
     VisualizerHandler.static_dir = ROOT

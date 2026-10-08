@@ -1,0 +1,11 @@
+version: 1
+
+# Evaluator-only answer key for benchmarks/tasks/harness_arithmetic_001.yaml.
+# Never referenced by runner.py or normalizer.py.
+test_id: harness_arithmetic_001
+
+checks:
+  - name: Calculation result is 5
+    field: result
+    op: numeric_equals
+    expected: 5

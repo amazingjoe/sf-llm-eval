@@ -15,9 +15,11 @@ import yaml
 from common import (
     DEFAULT_MAX_ROUNDS,
     DEFAULT_MAX_TOOL_CALLS,
+    FINISH_FUNCTION,
     add_usage,
     assistant_message,
     client_tool_calls,
+    completion_required,
     discover_config_file,
     extract_assistant_text,
     extract_search_annotations,
@@ -41,6 +43,7 @@ from tool_runtime import (
     advertised_client_tool_names,
     ensure_client_tools_supported,
     execute_client_tool,
+    finish_claim,
     test_needs_salesforce,
 )
 
@@ -57,8 +60,17 @@ def initial_messages(cfg: dict[str, Any]) -> list[dict[str, Any]]:
         messages.append({"role": "system", "content": request_cfg["system_prompt"]})
     for message in request_cfg.get("messages", []):
         messages.append(message)
-    messages.append({"role": "user", "content": test_cfg["prompt"]})
+    messages.append({"role": "user", "content": user_prompt(test_cfg)})
     return messages
+
+
+def user_prompt(test_cfg: dict[str, Any]) -> str:
+    """The task prompt plus its model-visible success criteria. Fixtures never enter here."""
+    prompt = str(test_cfg["prompt"])
+    criteria = test_cfg.get("success_criteria")
+    if not criteria:
+        return prompt
+    return f"{prompt.rstrip()}\n\nSuccess criteria:\n{str(criteria).strip()}"
 
 
 def build_payload(
@@ -135,6 +147,12 @@ def run_inference_loop(
     run_dir: Path,
     tool_context: ToolContext | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Run the chat/tool loop and write answer.txt, transcript.txt, completion.json.
+
+    The final answer is the text of the message that carries a valid
+    benchmark_finish call, or else the last assistant message. Hitting
+    max_rounds is recorded as a stop reason with an empty final answer.
+    """
     request_cfg = cfg["request"]
     timeout_seconds = request_cfg.get("timeout_seconds", 120)
     max_rounds = int(request_cfg.get("max_rounds") or DEFAULT_MAX_ROUNDS)
@@ -150,6 +168,11 @@ def run_inference_loop(
     tools = translate_tools(request_cfg.get("tools") or [])
     ensure_client_tools_supported(tools)
     client_tool_executions = 0
+    transcript: list[tuple[int, str]] = []
+    finish: dict[str, Any] | None = None
+    invalid_finish_calls: list[dict[str, Any]] = []
+    final_answer = ""
+    stop_reason: str | None = None
 
     for round_index in range(max_rounds):
         round_dir = run_dir / "rounds" / f"{round_index:02d}"
@@ -192,6 +215,9 @@ def run_inference_loop(
             )
 
         message = assistant_message(response_json)
+        text = message_text(response_json)
+        if text.strip():
+            transcript.append((round_index, text))
         pending = client_tool_calls(message)
         reason = finish_reason(response_json)
         round_trace: dict[str, Any] = {
@@ -212,15 +238,42 @@ def run_inference_loop(
         }
         trace_rounds.append(round_trace)
 
+        claim = None
+        for call in pending:
+            if tool_call_name(call) != FINISH_FUNCTION:
+                continue
+            parsed, error = finish_claim(call)
+            if parsed is not None:
+                claim = parsed
+            else:
+                invalid_finish_calls.append({"round_index": round_index, "error": error})
+
+        if claim is not None:
+            # A valid finish ends the run. Other calls in the same message are not run.
+            finish = {**claim, "round_index": round_index}
+            ignored = [
+                tool_call_name(call)
+                for call in pending
+                if tool_call_name(call) != FINISH_FUNCTION
+            ]
+            round_trace["finish"] = finish
+            if ignored:
+                round_trace["ignored_tool_calls"] = ignored
+            print(f"  finish: {claim['status']}")
+            final_answer = text
+            stop_reason = final_stop_reason(text, reason)
+            break
+
         if not pending:
+            final_answer = text
+            stop_reason = final_stop_reason(text, reason)
             break
 
         if round_index + 1 >= max_rounds:
             names = ", ".join(tool_call_name(call) for call in pending)
-            raise RuntimeError(
-                f"Hit request.max_rounds={max_rounds} with pending client "
-                f"tool call(s): {names}"
-            )
+            print(f"  stopped: hit max_rounds={max_rounds} with pending tool call(s): {names}")
+            stop_reason = "max_rounds"
+            break
 
         messages.append(message)
         tool_messages: list[dict[str, Any]] = []
@@ -247,17 +300,32 @@ def run_inference_loop(
             round_dir / "tool_messages.json",
             redact_secrets(tool_messages),
         )
-    else:
-        raise RuntimeError(
-            f"Hit request.max_rounds={max_rounds} without a final assistant answer."
-        )
 
-    assert first_payload is not None and last_response is not None
+    assert first_payload is not None and last_response is not None and stop_reason
+    finish_offered = FINISH_FUNCTION in advertised_client_tool_names(tools)
+    (run_dir / "answer.txt").write_text(final_answer, encoding="utf-8")
+    (run_dir / "transcript.txt").write_text(
+        "\n\n".join(f"--- round {index:02d} ---\n{text}" for index, text in transcript),
+        encoding="utf-8",
+    )
+    write_json(
+        run_dir / "completion.json",
+        {
+            "offered": finish_offered,
+            "required": completion_required(cfg),
+            "called": finish is not None,
+            "status": (finish or {}).get("status"),
+            "note": (finish or {}).get("note"),
+            "round_index": (finish or {}).get("round_index"),
+            "invalid_calls": invalid_finish_calls,
+        },
+    )
     write_json(
         run_dir / "tool_trace.json",
         {
             "max_rounds": max_rounds,
             "rounds_used": len(trace_rounds),
+            "stop_reason": stop_reason,
             "server_tools": [
                 tool.get("type") for tool in tools if tool_kind(tool) == "server"
             ],
@@ -270,9 +338,27 @@ def run_inference_loop(
         "latency_ms": round(last_latency, 2),
         "rounds": len(trace_rounds),
         "client_tool_executions": client_tool_executions,
+        "stop_reason": stop_reason,
+        "finish_status": (finish or {}).get("status"),
         **totals,
     }
     return last_response, metrics, first_payload
+
+
+def message_text(response_json: dict[str, Any]) -> str:
+    """Assistant text for this round; tool-call-only messages may omit content."""
+    try:
+        return extract_assistant_text(response_json)
+    except ValueError:
+        return ""
+
+
+def final_stop_reason(text: str, provider_finish_reason: str | None) -> str:
+    if provider_finish_reason == "length":
+        return "max_tokens"
+    if not text.strip():
+        return "empty_final"
+    return "completed"
 
 
 def run_subcommand(
@@ -281,6 +367,7 @@ def run_subcommand(
     run_dir: Path,
     suite_file: Path | None = None,
     config_file: Path | None = None,
+    extra_args: list[str] | None = None,
 ) -> int:
     script_path = Path(script)
     if not script_path.is_absolute():
@@ -299,6 +386,7 @@ def run_subcommand(
         cmd.extend(["--suite", str(suite_file)])
     if config_file is not None:
         cmd.extend(["--config", str(config_file)])
+    cmd.extend(extra_args or [])
     print(">", " ".join(cmd))
     completed = subprocess.run(cmd)
     return completed.returncode
@@ -434,9 +522,6 @@ def run_one_test(
         tool_context=tool_context,
     )
 
-    answer = extract_assistant_text(response_json)
-    (run_dir / "answer.txt").write_text(answer, encoding="utf-8")
-
     latency_ms = inference_metrics.get("latency_ms")
     metrics = {
         "suite_id": suite_meta.get("id"),
@@ -467,6 +552,12 @@ def run_one_test(
             if metrics.get("client_tool_executions")
             else ""
         )
+        + f" | Stop: {metrics.get('stop_reason')}"
+        + (
+            f" | Finish: {metrics.get('finish_status')}"
+            if metrics.get("finish_status")
+            else ""
+        )
     )
 
     result: dict[str, Any] = {
@@ -478,6 +569,10 @@ def run_one_test(
         "status": "completed",
         "score": None,
         "error": None,
+        "stop_reason": metrics.get("stop_reason"),
+        "self_assessment": None,
+        "tool_calls": None,
+        "delivery": None,
     }
 
     if no_pipeline:
@@ -516,6 +611,11 @@ def run_one_test(
                 evaluation = None
             if isinstance(evaluation, dict):
                 result["score"] = evaluation.get("score")
+                result["self_assessment"] = (
+                    evaluation.get("self_assessment") or {}
+                ).get("label")
+                result["tool_calls"] = (evaluation.get("tool_calls") or {}).get("counts")
+                result["delivery"] = (evaluation.get("delivery") or {}).get("label")
                 if evaluation.get("passed") is True:
                     result["status"] = "pass"
                 elif evaluation.get("passed") is False:
@@ -528,7 +628,45 @@ def run_one_test(
         elif result["status"] == "completed":
             result["status"] = "pass"
 
+        if result.get("delivery") == "pending" and normalizer.get("script"):
+            result["delivery"] = run_delivery_pass(
+                normalizer_script=normalizer["script"],
+                evaluator_script=evaluator["script"],
+                test_file=test_file,
+                run_dir=run_dir,
+                suite_file=suite_file,
+                config_file=config_file,
+            )
+
     return result
+
+
+def run_delivery_pass(
+    *,
+    normalizer_script: str,
+    evaluator_script: str,
+    test_file: Path,
+    run_dir: Path,
+    suite_file: Path,
+    config_file: Path,
+) -> str:
+    """Normalize the whole transcript and label delivery. Never changes pass/fail."""
+    print("Delivery pass: normalizing the full transcript")
+    common_args = dict(suite_file=suite_file, config_file=config_file)
+    code = run_subcommand(
+        normalizer_script, test_file, run_dir, extra_args=["--source", "transcript"], **common_args
+    )
+    if code != 0:
+        # No normalized_transcript.json; the evaluator labels delivery unavailable.
+        print(f"Delivery pass: transcript normalizer exited with code {code}")
+    run_subcommand(
+        evaluator_script, test_file, run_dir, extra_args=["--delivery"], **common_args
+    )
+    try:
+        evaluation = read_json(run_dir / "evaluation.json")
+    except Exception:
+        return "unavailable"
+    return str(((evaluation or {}).get("delivery") or {}).get("label") or "unavailable")
 
 
 def select_entries(
@@ -713,6 +851,10 @@ def main() -> None:
                 "status": "error",
                 "score": None,
                 "error": str(exc),
+                "stop_reason": None,
+                "self_assessment": None,
+                "tool_calls": None,
+                "delivery": None,
             }
             print(f"ERROR: {exc}")
         results.append(result)

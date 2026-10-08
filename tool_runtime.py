@@ -5,7 +5,14 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from common import redact_secrets, tool_call_name, tool_kind
+from common import (
+    FINISH_FUNCTION,
+    FINISH_SHORTHAND,
+    FINISH_STATUSES,
+    redact_secrets,
+    tool_call_name,
+    tool_kind,
+)
 
 from salesforce import (
     SalesforceCliProvider,
@@ -16,6 +23,31 @@ from salesforce import (
 )
 
 DEFAULT_MAX_TOOL_RESULT_CHARS = 120_000
+MAX_FINISH_NOTE_CHARS = 500
+
+FINISH_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": FINISH_FUNCTION,
+        "description": (
+            "Record that you are done. Call this in the same message as your final "
+            "answer to the user; the text of that message is the answer the user "
+            "receives. status is the outcome you claim: answered (you gave the "
+            "requested information), not_found (it does not exist or could not be "
+            "found), or declined (you chose not to do it). note is a short private "
+            "remark for the benchmark and is never shown to the user."
+        ),
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["status"],
+            "properties": {
+                "status": {"type": "string", "enum": list(FINISH_STATUSES)},
+                "note": {"type": "string", "description": "Short private remark."},
+            },
+        },
+    },
+}
 
 
 @dataclass
@@ -26,14 +58,39 @@ class ToolContext:
 
 def translate_client_shorthand(key: str) -> dict[str, Any] | None:
     """Expand a YAML shorthand into an OpenAI function tool, or raise if reserved."""
+    if key.strip() in (FINISH_SHORTHAND, FINISH_FUNCTION):
+        return json.loads(json.dumps(FINISH_SCHEMA))
     message = not_implemented_message(key)
     if message:
         raise ValueError(f"Tool '{key}' is not implemented. {message}")
     return schema_for_shorthand(key)
 
 
+def finish_claim(call: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    """Parse a benchmark_finish call into {status, note}, or return an error."""
+    args, parse_error = parse_tool_arguments(call)
+    if parse_error:
+        return None, parse_error
+    status = (args or {}).get("status")
+    if status not in FINISH_STATUSES:
+        return None, f"status must be one of: {', '.join(FINISH_STATUSES)}"
+    note = (args or {}).get("note")
+    note = "" if note is None else str(note)[:MAX_FINISH_NOTE_CHARS]
+    return {"status": status, "note": note}, None
+
+
+def handle_finish(args: dict[str, Any], _context: ToolContext) -> dict[str, Any]:
+    # Only reached for an invalid claim; a valid claim ends the run in runner.py.
+    status = (args or {}).get("status")
+    if status not in FINISH_STATUSES:
+        return {
+            "error": f"status must be one of: {', '.join(FINISH_STATUSES)}. Call {FINISH_FUNCTION} again."
+        }
+    return {"recorded": True}
+
+
 def handlers() -> dict[str, Callable[[dict[str, Any], ToolContext], dict[str, Any]]]:
-    return SALESFORCE_HANDLERS
+    return {**SALESFORCE_HANDLERS, FINISH_FUNCTION: handle_finish}
 
 
 def function_name_from_tool(tool: dict[str, Any]) -> str | None:

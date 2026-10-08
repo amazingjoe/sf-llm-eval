@@ -38,8 +38,12 @@ function parseHash() {
     };
   }
   if (parts[0] === "config") return { view: "config" };
-  if (parts[0] === "tests" && parts[1] === "new") return { view: "test-new" };
-  if (parts[0] === "tests" && parts[1]) return { view: "test-edit", filename: parts[1] };
+  if (parts[0] === "tests" && parts[1] === "new") return { view: "test-new", source: "tests" };
+  if (parts[0] === "tests" && parts[1]) return { view: "test-edit", filename: parts[1], source: "tests" };
+  if (parts[0] === "benchmarks" && parts[1] === "new") return { view: "test-new", source: "benchmarks" };
+  if (parts[0] === "benchmarks" && parts[1]) {
+    return { view: "test-edit", filename: parts[1], source: "benchmarks" };
+  }
   if (parts[0] === "tests") return { view: "tests" };
   if (parts[0] === "suites" && parts[1] === "new") return { view: "suite-new" };
   if (parts[0] === "suites" && parts[1]) return { view: "suite-edit", filename: parts[1] };
@@ -53,8 +57,10 @@ function setHash(route) {
   else if (view === "board") location.hash = "#runs";
   else if (view === "config") location.hash = "#config";
   else if (view === "tests") location.hash = "#tests";
-  else if (view === "test-new") location.hash = "#tests/new";
-  else if (view === "test-edit") location.hash = `#tests/${encodeURIComponent(route.filename)}`;
+  else if (view === "test-new") location.hash = `#${route.source === "benchmarks" ? "benchmarks" : "tests"}/new`;
+  else if (view === "test-edit") {
+    location.hash = `#${route.source === "benchmarks" ? "benchmarks" : "tests"}/${encodeURIComponent(route.filename)}`;
+  }
   else if (view === "suites") location.hash = "#suites";
   else if (view === "suite-new") location.hash = "#suites/new";
   else if (view === "suite-edit") location.hash = `#suites/${encodeURIComponent(route.filename)}`;

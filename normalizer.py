@@ -50,6 +50,32 @@ def extract_json_object(text: str) -> Any:
     raise ValueError("Normalizer did not return parseable JSON.")
 
 
+# The graded pass reads the final answer. The delivery pass reads every assistant
+# message and writes to separate files, so it can never overwrite the grade.
+SOURCES: dict[str, dict[str, str]] = {
+    "answer": {
+        "input": "answer.txt",
+        "label": "SUBJECT MODEL ANSWER",
+        "normalized": "normalized.json",
+        "parse_error": "normalized_parse_error.txt",
+        "prefix": "normalizer",
+    },
+    "transcript": {
+        "input": "transcript.txt",
+        "label": "SUBJECT MODEL TRANSCRIPT",
+        "normalized": "normalized_transcript.json",
+        "parse_error": "normalized_transcript_parse_error.txt",
+        "prefix": "normalizer_transcript",
+    },
+}
+
+TRANSCRIPT_NOTE = (
+    "The text below is every message the subject model wrote during the run, in "
+    "order, not only its final answer. Extract the facts it states anywhere in it. "
+    "If messages conflict, use the latest statement."
+)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Normalize a raw benchmark answer into the configured JSON schema."
@@ -64,7 +90,15 @@ def main() -> None:
         help="Path to config.yaml (normalizer model). Discovered automatically if omitted.",
     )
     parser.add_argument("--run-dir", required=True, help="Existing benchmark run directory.")
+    parser.add_argument(
+        "--source",
+        choices=sorted(SOURCES),
+        default="answer",
+        help="answer (graded, default) or transcript (delivery diagnosis only).",
+    )
     args = parser.parse_args()
+    source = SOURCES[args.source]
+    prefix = source["prefix"]
 
     test_file = Path(args.test).resolve()
     run_dir = Path(args.run_dir).resolve()
@@ -74,7 +108,7 @@ def main() -> None:
     )
     normalizer_cfg = cfg["pipeline"]["normalizer"]
 
-    answer_path = run_dir / "answer.txt"
+    answer_path = run_dir / source["input"]
     if not answer_path.exists():
         raise SystemExit(f"Missing {answer_path}. Run runner.py first.")
 
@@ -90,6 +124,9 @@ def main() -> None:
         ),
     )
 
+    if args.source == "transcript":
+        instructions = f"{instructions}\n\n{TRANSCRIPT_NOTE}"
+
     normalizer_prompt = f"""You are a benchmark normalization layer.
 
 {instructions}
@@ -97,7 +134,7 @@ def main() -> None:
 JSON schema:
 {json.dumps(schema, indent=2)}
 
-SUBJECT MODEL ANSWER:
+{source["label"]}:
 ---BEGIN ANSWER---
 {answer}
 ---END ANSWER---
@@ -131,9 +168,9 @@ Return only the normalized JSON object.
         **normalizer_cfg.get("headers", {}),
     }
 
-    write_json(run_dir / "normalizer_request.json", payload)
+    write_json(run_dir / f"{prefix}_request.json", payload)
     write_json(
-        run_dir / "normalizer_request_meta.json",
+        run_dir / f"{prefix}_request_meta.json",
         {
             "endpoint": endpoint,
             "headers": redact_secrets(headers),
@@ -150,11 +187,11 @@ Return only the normalized JSON object.
     )
     latency_ms = round((time.perf_counter() - start) * 1000, 2)
 
-    (run_dir / "normalizer_response.raw.txt").write_text(
+    (run_dir / f"{prefix}_response.raw.txt").write_text(
         response.text, encoding="utf-8"
     )
     write_json(
-        run_dir / "normalizer_response_meta.json",
+        run_dir / f"{prefix}_response_meta.json",
         {
             "status_code": response.status_code,
             "headers": dict(response.headers),
@@ -167,32 +204,32 @@ Return only the normalized JSON object.
     except ValueError:
         raise SystemExit(
             f"Normalizer returned non-JSON HTTP response. "
-            f"See {run_dir / 'normalizer_response.raw.txt'}"
+            f"See {run_dir / f'{prefix}_response.raw.txt'}"
         )
 
-    write_json(run_dir / "normalizer_response.json", response_json)
+    write_json(run_dir / f"{prefix}_response.json", response_json)
 
     if not response.ok:
         raise SystemExit(
             f"Normalizer returned HTTP {response.status_code}. "
-            f"See {run_dir / 'normalizer_response.json'}"
+            f"See {run_dir / f'{prefix}_response.json'}"
         )
 
     text = extract_assistant_text(response_json)
     try:
         normalized = extract_json_object(text)
     except Exception as exc:
-        (run_dir / "normalized_parse_error.txt").write_text(
+        (run_dir / source["parse_error"]).write_text(
             str(exc) + "\n\n" + text, encoding="utf-8"
         )
         raise SystemExit(
             f"Could not parse normalizer output as JSON. "
-            f"See {run_dir / 'normalized_parse_error.txt'}"
+            f"See {run_dir / source['parse_error']}"
         )
 
-    write_json(run_dir / "normalized.json", normalized)
+    write_json(run_dir / source["normalized"], normalized)
     write_json(
-        run_dir / "normalizer_metrics.json",
+        run_dir / f"{prefix}_metrics.json",
         {
             "model": normalizer_cfg["model"],
             "latency_ms": latency_ms,
@@ -200,7 +237,7 @@ Return only the normalized JSON object.
         },
     )
 
-    print(f"Normalized output written to {run_dir / 'normalized.json'}")
+    print(f"Normalized output written to {run_dir / source['normalized']}")
 
 
 if __name__ == "__main__":

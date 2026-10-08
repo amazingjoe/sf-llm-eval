@@ -38,13 +38,32 @@ function expectedToInput(value) {
   return JSON.stringify(value);
 }
 
-function blankTest() {
+function isBenchmarkEditor() {
+  return Boolean(state.editor && state.editor.source === "benchmarks");
+}
+
+function blankFixture() {
+  return {
+    version: 1,
+    test_id: "",
+    checks: [{ name: "", field: "", op: "equals", expected: "" }],
+  };
+}
+
+function blankTest(source = "tests") {
+  const data = blankLocalTest();
+  if (source === "benchmarks") delete data.pipeline.evaluator.checks;
+  return data;
+}
+
+function blankLocalTest() {
   return {
     version: 1,
     test: {
       id: "",
       name: "",
       prompt: "",
+      success_criteria: "",
       metadata: {
         category: "",
         difficulty: "easy",
@@ -211,29 +230,43 @@ async function renderTests() {
       "difficulty",
       "benchmark_group",
     ]);
-    app.innerHTML = `
-      <div class="list-toolbar">
-        <p class="muted">Each file in <code>tests/</code> is a reusable case. Suites pick which ones to run.</p>
-        <a class="primary" href="#tests/new">New test</a>
-      </div>
-      ${
-        tests.length
-          ? `<div class="library-list">${tests
-              .map(
-                (test) => `
-            <button type="button" class="library-card" data-open-file="tests/${escapeHtml(test.filename)}">
+    const card = (test) => `
+            <button type="button" class="library-card" data-open-file="${escapeHtml(
+              test.source || "tests"
+            )}/${escapeHtml(test.filename)}">
               <div>
                 <strong>${escapeHtml(test.name || test.test_id || test.filename)}</strong>
-                <div class="meta">${escapeHtml(test.filename)} · ${escapeHtml(test.test_id || "")}</div>
+                <div class="meta">${escapeHtml(test.path || test.filename)} · ${escapeHtml(test.test_id || "")}</div>
               </div>
               <div class="meta">${escapeHtml(test.difficulty || "")}${
-                  test.check_count ? ` · ${test.check_count} checks` : ""
-                }${test.used_in?.length ? `<br>in ${escapeHtml(test.used_in.join(", "))}` : ""}</div>
-            </button>`
-              )
-              .join("")}</div>`
-          : `<div class="empty">No tests match that filter.</div>`
+                test.check_count ? ` · ${test.check_count} checks` : ""
+              }${test.used_in?.length ? `<br>in ${escapeHtml(test.used_in.join(", "))}` : ""}</div>
+            </button>`;
+    const section = (title, blurb, href, label, items) => `
+      <div class="list-toolbar">
+        <p class="muted"><strong>${title}.</strong> ${blurb}</p>
+        <a class="primary" href="${href}">${label}</a>
+      </div>
+      ${
+        items.length
+          ? `<div class="library-list">${items.map(card).join("")}</div>`
+          : `<div class="empty">No ${title.toLowerCase()} match that filter.</div>`
       }`;
+    app.innerHTML = `
+      ${section(
+        "Benchmark tasks",
+        "Committed tasks in <code>benchmarks/tasks/</code>. Their answer keys live in <code>benchmarks/fixtures/</code>, which the model never sees.",
+        "#benchmarks/new",
+        "New benchmark task",
+        tests.filter((test) => test.source === "benchmarks")
+      )}
+      ${section(
+        "Local tests",
+        "Files in <code>tests/</code> are gitignored local experiments. Suites pick which ones to run.",
+        "#tests/new",
+        "New local test",
+        tests.filter((test) => test.source !== "benchmarks")
+      )}`;
   } catch (err) {
     app.innerHTML = `<div class="error-banner">${escapeHtml(err.message)}</div>`;
   }
@@ -389,7 +422,10 @@ function paintTestEditor() {
   const evaluator = (data.pipeline || {}).evaluator || {};
   const nparams = normalizer.parameters || {};
   const rows = schemaRows(normalizer.schema);
-  const checks = evaluator.checks && evaluator.checks.length ? evaluator.checks : [{ name: "", field: "", op: "equals", expected: "" }];
+  const benchmark = isBenchmarkEditor();
+  const savedChecks = benchmark ? (state.editor.fixture || {}).checks : evaluator.checks;
+  const checks = savedChecks && savedChecks.length ? savedChecks : [{ name: "", field: "", op: "equals", expected: "" }];
+  const fixtureFile = state.editor.fixturePath || (filename ? `benchmarks/fixtures/${filename}` : "benchmarks/fixtures/");
   const filename = state.editor.isNew ? fieldValue("test-filename") || state.editor.filename : state.editor.filename;
 
   app.innerHTML = `
@@ -435,6 +471,11 @@ function paintTestEditor() {
           <div class="field-block wide">
             <label for="test-prompt">User prompt</label>
             <textarea id="test-prompt">${escapeHtml((test.prompt || "").trim())}</textarea>
+          </div>
+          <div class="field-block wide">
+            <label for="test-criteria">Success criteria</label>
+            <textarea id="test-criteria">${escapeHtml((test.success_criteria || "").trim())}</textarea>
+            <span class="hint">Sent to the model after the prompt. Describe what a good answer contains, never the answer itself.</span>
           </div>
           <div class="field-block wide">
             <label for="test-system">System prompt</label>
@@ -515,7 +556,14 @@ function paintTestEditor() {
         </div>
       </article>
       <article class="panel">
-        <h3>Evaluator checks</h3>
+        <h3>${benchmark ? "Fixture checks" : "Evaluator checks"}</h3>
+        ${
+          benchmark
+            ? `<p class="muted">The answer key. Saved to <code>${escapeHtml(
+                fixtureFile
+              )}</code> and read only by the evaluator; the model never sees it.</p>`
+            : ""
+        }
         <div class="checks-box">
           <label class="inline-check"><input id="eval-enabled" type="checkbox" ${
             evaluator.enabled === false ? "" : "checked"
@@ -557,11 +605,23 @@ function paintTestEditor() {
 async function renderTestEditor() {
   try {
     if (!state.editor || state.editor.kind !== "test") {
+      const source = state.route.source === "benchmarks" ? "benchmarks" : "tests";
       if (state.route.view === "test-new") {
-        state.editor = { kind: "test", filename: "", isNew: true, data: blankTest() };
+        state.editor = {
+          kind: "test",
+          source,
+          filename: "",
+          isNew: true,
+          data: blankTest(source),
+          fixture: source === "benchmarks" ? blankFixture() : null,
+        };
       } else {
-        const doc = await fetchJson(`/api/tests/${encodeURIComponent(state.route.filename)}`);
-        state.editor = { kind: "test", filename: doc.filename, isNew: false, data: doc.data };
+        const doc = await fetchJson(`/api/${source}/${encodeURIComponent(state.route.filename)}`);
+        state.editor = { kind: "test", source, filename: doc.filename, isNew: false, data: doc.data };
+        if (source === "benchmarks") {
+          state.editor.fixture = (doc.fixture && doc.fixture.data) || blankFixture();
+          state.editor.fixturePath = doc.fixture && doc.fixture.path;
+        }
       }
     }
     paintTestEditor();
@@ -631,7 +691,12 @@ function collectTest() {
   evaluator.enabled = fieldChecked("eval-enabled");
   evaluator.script = evaluator.script || "evaluator.py";
   evaluator.require_schema_valid = fieldChecked("eval-schema-valid");
-  evaluator.checks = collectChecks();
+  if (isBenchmarkEditor()) {
+    delete evaluator.checks;
+    state.editor.fixture = { ...(state.editor.fixture || blankFixture()), checks: collectChecks() };
+  } else {
+    evaluator.checks = collectChecks();
+  }
   pipeline.normalizer = normalizer;
   pipeline.evaluator = evaluator;
   const testBlock = {
@@ -639,6 +704,7 @@ function collectTest() {
       id: fieldValue("test-id").trim(),
       name: fieldValue("test-name").trim(),
       prompt: fieldValue("test-prompt"),
+      success_criteria: fieldValue("test-criteria"),
       metadata: {
         ...((data.test || {}).metadata || {}),
         category: fieldValue("test-category").trim(),
@@ -648,6 +714,7 @@ function collectTest() {
       },
     };
   delete testBlock.emoji;
+  if (!testBlock.success_criteria.trim()) delete testBlock.success_criteria;
   return {
     ...data,
     version: data.version || 1,
@@ -820,15 +887,25 @@ async function saveCurrent() {
       let filename = fieldValue("test-filename").trim() || state.editor.filename;
       if (!filename) filename = suggestedFilename(data.test.id, "new_test.yaml");
       if (!filename.endsWith(".yaml") && !filename.endsWith(".yml")) filename += ".yaml";
-      const saved = await putJson(`/api/tests/${encodeURIComponent(filename)}`, { data });
+      const source = state.editor.source || "tests";
+      const body = source === "benchmarks" ? { data, fixture: state.editor.fixture } : { data };
+      const saved = await putJson(`/api/${source}/${encodeURIComponent(filename)}`, body);
       state.workspace = null;
       state.tests = [];
-      showToast(`Saved tests/${filename}`);
+      showToast(
+        source === "benchmarks"
+          ? `Saved ${saved.path} and ${saved.fixture ? saved.fixture.path : "its fixture"}`
+          : `Saved tests/${filename}`
+      );
       if (view === "test-new" || filename !== state.editor.filename) {
-        state.editor = { kind: "test", filename: saved.filename, isNew: false, data: saved.data };
-        setHash({ view: "test-edit", filename: saved.filename });
+        state.editor = null;
+        setHash({ view: "test-edit", filename: saved.filename, source });
       } else {
         state.editor.data = saved.data;
+        if (source === "benchmarks" && saved.fixture) {
+          state.editor.fixture = saved.fixture.data;
+          state.editor.fixturePath = saved.fixture.path;
+        }
       }
       return;
     }
@@ -853,11 +930,17 @@ async function saveCurrent() {
   }
 }
 
+function editorChecks() {
+  if (isBenchmarkEditor()) return state.editor.fixture.checks;
+  return state.editor.data.pipeline.evaluator.checks;
+}
+
 function handleStudioClick(event) {
   const open = event.target.closest("[data-open-file]");
   if (open) {
     const [kind, filename] = open.getAttribute("data-open-file").split("/");
-    setHash({ view: kind === "tests" ? "test-edit" : "suite-edit", filename });
+    if (kind === "suites") setHash({ view: "suite-edit", filename });
+    else setHash({ view: "test-edit", filename, source: kind });
     return true;
   }
   if (!state.editor) return false;
@@ -886,7 +969,7 @@ function handleStudioClick(event) {
   }
   if (event.target.closest("[data-add-check]")) {
     state.editor.data = collectTest();
-    state.editor.data.pipeline.evaluator.checks.push({
+    editorChecks().push({
       name: "",
       field: "",
       op: "equals",
@@ -898,7 +981,7 @@ function handleStudioClick(event) {
   const removeCheck = event.target.closest("[data-remove-check]");
   if (removeCheck) {
     state.editor.data = collectTest();
-    state.editor.data.pipeline.evaluator.checks.splice(
+    editorChecks().splice(
       Number(removeCheck.getAttribute("data-remove-check")),
       1
     );
